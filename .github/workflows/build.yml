@@ -1,0 +1,835 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Generar proyecto
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'TVEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.tvcontrol"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.tvcontrol"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildFeatures { compose = true }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+
+              packaging {
+                  resources.excludes += setOf(
+                      "/META-INF/{AL2.0,LGPL2.1}",
+                      "META-INF/INDEX.LIST",
+                      "META-INF/io.netty.versions.properties",
+                      "META-INF/DEPENDENCIES"
+                  )
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.core:core-ktx:1.13.1")
+              // Cliente ADB en Kotlin puro (conecta por TCP a la TV)
+              implementation("dev.mobile:dadb:1.2.10")
+          }
+          TVEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'TVEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="TV Control"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/Adb.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import android.content.ContentResolver
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.OpenableColumns
+          import dadb.AdbKeyPair
+          import dadb.Dadb
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          /** Capa fina sobre dadb. Todas las llamadas corren en Dispatchers.IO. */
+          object Adb {
+              @Volatile
+              private var dadb: Dadb? = null
+              val connected: Boolean get() = dadb != null
+
+              private fun keys(ctx: Context): AdbKeyPair {
+                  val priv = File(ctx.filesDir, "adbkey")
+                  val pub = File(ctx.filesDir, "adbkey.pub")
+                  if (!priv.exists() || !pub.exists()) AdbKeyPair.generate(priv, pub)
+                  return AdbKeyPair.read(priv, pub)
+              }
+
+              /** La primera vez la TV muestra "¿Permitir depuración USB?": hay que aceptar. */
+              suspend fun connect(ctx: Context, host: String, port: Int) = withContext(Dispatchers.IO) {
+                  disconnect()
+                  val d = Dadb.create(host, port, keys(ctx))
+                  d.shell("echo ok") // fuerza la autenticación
+                  dadb = d
+              }
+
+              fun disconnect() {
+                  runCatching { dadb?.close() }
+                  dadb = null
+              }
+
+              private fun d(): Dadb = dadb ?: error("No conectado")
+
+              fun q(s: String) = "'" + s.replace("'", "'\\''") + "'"
+
+              suspend fun shell(cmd: String): String = withContext(Dispatchers.IO) { d().shell(cmd).allOutput }
+
+              suspend fun push(src: File, remote: String) = withContext(Dispatchers.IO) { d().push(src, remote) }
+
+              suspend fun pull(dst: File, remote: String) = withContext(Dispatchers.IO) { d().pull(dst, remote) }
+
+              suspend fun install(f: File) = withContext(Dispatchers.IO) { d().install(f) }
+
+              suspend fun key(code: Int) = shell("input keyevent $code")
+          }
+
+          // ---------- utilidades de archivos locales / Uri ----------
+
+          fun displayName(cr: ContentResolver, uri: Uri): String {
+              cr.query(uri, null, null, null, null)?.use { c ->
+                  val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                  if (i >= 0 && c.moveToFirst()) return c.getString(i)
+              }
+              return uri.lastPathSegment?.substringAfterLast('/') ?: "archivo"
+          }
+
+          /** Copia un Uri elegido con el selector del sistema a la caché de la app. */
+          suspend fun copyUriToCache(ctx: Context, uri: Uri): File = withContext(Dispatchers.IO) {
+              val dir = File(ctx.cacheDir, "up").apply { mkdirs() }
+              val out = File(dir, displayName(ctx.contentResolver, uri))
+              ctx.contentResolver.openInputStream(uri)!!.use { i -> out.outputStream().use { o -> i.copyTo(o) } }
+              out
+          }
+
+          suspend fun copyFileToUri(ctx: Context, f: File, uri: Uri) = withContext(Dispatchers.IO) {
+              ctx.contentResolver.openOutputStream(uri)!!.use { o -> f.inputStream().use { i -> i.copyTo(o) } }
+          }
+
+          fun cacheFile(ctx: Context, name: String): File =
+              File(ctx.cacheDir, "down").apply { mkdirs() }.let { File(it, name) }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/AppsScreen.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.launch
+
+          data class AppItem(val pkg: String, val disabled: Boolean)
+          data class PermItem(val name: String, val granted: Boolean)
+
+          @Composable
+          fun AppsScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var apps by remember { mutableStateOf(listOf<AppItem>()) }
+              var filter by remember { mutableStateOf("") }
+              var showSystem by remember { mutableStateOf(false) }
+              var msg by remember { mutableStateOf("") }
+              var selected by remember { mutableStateOf<AppItem?>(null) }
+              var permsFor by remember { mutableStateOf<String?>(null) }
+              var perms by remember { mutableStateOf(listOf<PermItem>()) }
+              var pendingApk by remember { mutableStateOf<String?>(null) }
+
+              fun load() = scope.launch {
+                  try {
+                      val all = Adb.shell("pm list packages ${if (showSystem) "" else "-3"}")
+                      val dis = Adb.shell("pm list packages -d").lines().map { it.removePrefix("package:").trim() }.toSet()
+                      apps = all.lines().filter { it.startsWith("package:") }
+                          .map { it.removePrefix("package:").trim() }.sorted()
+                          .map { AppItem(it, it in dis) }
+                  } catch (e: Throwable) { msg = "Error: ${e.message}" }
+              }
+
+              fun loadPerms(pkg: String) = scope.launch {
+                  val out = Adb.shell("dumpsys package ${Adb.q(pkg)}")
+                  val idx = out.indexOf("runtime permissions:")
+                  val res = mutableListOf<PermItem>()
+                  if (idx >= 0) {
+                      val re = Regex("""^\s+([\w.]+): granted=(true|false)""")
+                      for (line in out.substring(idx).lines().drop(1)) {
+                          val m = re.find(line) ?: break
+                          res += PermItem(m.groupValues[1], m.groupValues[2] == "true")
+                      }
+                  }
+                  perms = res
+                  permsFor = pkg
+              }
+
+              fun run(label: String, cmd: String) = scope.launch {
+                  msg = try { Adb.shell(cmd).trim().ifEmpty { "$label: listo" } } catch (e: Throwable) { "Error: ${e.message}" }
+                  load()
+              }
+
+              val installPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                  if (uris.isEmpty()) return@rememberLauncherForActivityResult
+                  scope.launch {
+                      uris.forEachIndexed { i, u ->
+                          msg = "Instalando ${i + 1}/${uris.size}…"
+                          msg = try { Adb.install(copyUriToCache(ctx, u)); "Instalado (${i + 1}/${uris.size})" }
+                          catch (e: Throwable) { "Error al instalar: ${e.message}" }
+                      }
+                      load()
+                  }
+              }
+
+              val saveApk = rememberLauncherForActivityResult(
+                  ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")
+              ) { uri ->
+                  val pkg = pendingApk
+                  if (uri == null || pkg == null) return@rememberLauncherForActivityResult
+                  scope.launch {
+                      msg = try {
+                          val remote = Adb.shell("pm path ${Adb.q(pkg)}").lines().first { it.startsWith("package:") }
+                              .removePrefix("package:").trim()
+                          val f = cacheFile(ctx, "$pkg.apk")
+                          Adb.pull(f, remote)
+                          copyFileToUri(ctx, f, uri)
+                          "APK guardado"
+                      } catch (e: Throwable) { "Error: ${e.message}" }
+                  }
+              }
+
+              LaunchedEffect(showSystem) { load() }
+
+              Column(Modifier.fillMaxSize().padding(12.dp)) {
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Button(onClick = { installPicker.launch(arrayOf("application/vnd.android.package-archive", "application/octet-stream")) }) {
+                          Text("Instalar APK")
+                      }
+                      OutlinedButton(onClick = { run("Caché", "pm trim-caches 999G") }) { Text("Limpiar caché") }
+                  }
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Checkbox(showSystem, { showSystem = it })
+                      Text("Incluir apps del sistema")
+                  }
+                  OutlinedTextField(filter, { filter = it }, label = { Text("Buscar") },
+                      singleLine = true, modifier = Modifier.fillMaxWidth())
+                  if (msg.isNotEmpty()) Text(msg, style = MaterialTheme.typography.bodySmall)
+                  LazyColumn(Modifier.fillMaxSize()) {
+                      items(apps.filter { it.pkg.contains(filter, true) }) { a ->
+                          Text(
+                              a.pkg + if (a.disabled) "  (deshabilitada)" else "",
+                              Modifier.fillMaxWidth().clickable { selected = a }.padding(vertical = 12.dp)
+                          )
+                          HorizontalDivider()
+                      }
+                  }
+              }
+
+              selected?.let { a ->
+                  val p = Adb.q(a.pkg)
+                  AlertDialog(
+                      onDismissRequest = { selected = null },
+                      confirmButton = { TextButton(onClick = { selected = null }) { Text("Cerrar") } },
+                      title = { Text(a.pkg, style = MaterialTheme.typography.titleSmall) },
+                      text = {
+                          Column {
+                              @Composable
+                              fun item(t: String, f: () -> Unit) =
+                                  TextButton(onClick = { selected = null; f() }) { Text(t) }
+                              item("Abrir") {
+                                  run("Abrir", "monkey -p $p -c android.intent.category.LEANBACK_LAUNCHER 1 2>/dev/null || monkey -p $p -c android.intent.category.LAUNCHER 1")
+                              }
+                              item("Forzar detención") { run("Detenida", "am force-stop $p") }
+                              item("Borrar datos") { run("Datos borrados", "pm clear $p") }
+                              if (a.disabled) item("Habilitar") { run("Habilitada", "pm enable $p") }
+                              else item("Deshabilitar") { run("Deshabilitada", "pm disable-user --user 0 $p") }
+                              item("Permisos…") { loadPerms(a.pkg) }
+                              item("Descargar APK") { pendingApk = a.pkg; saveApk.launch("${a.pkg}.apk") }
+                              item("Desinstalar") { run("Desinstalada", "pm uninstall --user 0 $p") }
+                          }
+                      }
+                  )
+              }
+
+              permsFor?.let { pkg ->
+                  AlertDialog(
+                      onDismissRequest = { permsFor = null },
+                      confirmButton = { TextButton(onClick = { permsFor = null }) { Text("Cerrar") } },
+                      title = { Text("Permisos") },
+                      text = {
+                          if (perms.isEmpty()) Text("Esta app no tiene permisos de ejecución.")
+                          else LazyColumn {
+                              items(perms) { pm ->
+                                  Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                      Text(pm.name.removePrefix("android.permission."), Modifier.weight(1f),
+                                          style = MaterialTheme.typography.bodySmall)
+                                      Switch(pm.granted, { on ->
+                                          scope.launch {
+                                              Adb.shell("pm ${if (on) "grant" else "revoke"} ${Adb.q(pkg)} ${pm.name}")
+                                              loadPerms(pkg)
+                                          }
+                                      })
+                                  }
+                              }
+                          }
+                      }
+                  )
+              }
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/FilesScreen.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.launch
+
+          @Composable
+          fun FilesScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var path by remember { mutableStateOf("/sdcard") }
+              var entries by remember { mutableStateOf(listOf<String>()) }
+              var msg by remember { mutableStateOf("") }
+              var selected by remember { mutableStateOf<String?>(null) }
+              var pendingDownload by remember { mutableStateOf<String?>(null) }
+              var showMkdir by remember { mutableStateOf(false) }
+              var newDir by remember { mutableStateOf("") }
+
+              fun join(dir: String, name: String) = if (dir == "/") "/$name" else "$dir/$name"
+
+              fun load() = scope.launch {
+                  val out = try { Adb.shell("ls -1Ap ${Adb.q(path)} 2>&1") } catch (e: Throwable) { "Error: ${e.message}" }
+                  if (out.contains("No such file") || out.contains("Permission denied") || out.startsWith("Error")) {
+                      msg = out.trim(); entries = emptyList()
+                  } else {
+                      msg = ""
+                      entries = out.lines().filter { it.isNotBlank() }
+                          .sortedWith(compareBy({ !it.endsWith("/") }, { it.lowercase() }))
+                  }
+              }
+
+              val upload = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                  if (uris.isEmpty()) return@rememberLauncherForActivityResult
+                  scope.launch {
+                      uris.forEachIndexed { i, u ->
+                          msg = "Subiendo ${i + 1}/${uris.size}…"
+                          try {
+                              val f = copyUriToCache(ctx, u)
+                              Adb.push(f, join(path, f.name))
+                          } catch (e: Throwable) { msg = "Error: ${e.message}"; return@launch }
+                      }
+                      msg = "Subida completa"
+                      load()
+                  }
+              }
+
+              val download = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+                  val remote = pendingDownload
+                  if (uri == null || remote == null) return@rememberLauncherForActivityResult
+                  scope.launch {
+                      msg = try {
+                          val f = cacheFile(ctx, remote.substringAfterLast('/'))
+                          Adb.pull(f, remote)
+                          copyFileToUri(ctx, f, uri)
+                          "Archivo guardado"
+                      } catch (e: Throwable) { "Error: ${e.message}" }
+                  }
+              }
+
+              LaunchedEffect(path) { load() }
+
+              Column(Modifier.fillMaxSize().padding(12.dp)) {
+                  Text(path, style = MaterialTheme.typography.titleSmall)
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                      OutlinedButton(onClick = { if (path != "/") path = path.trimEnd('/').substringBeforeLast('/').ifEmpty { "/" } }) { Text("⬆ Subir") }
+                      OutlinedButton(onClick = { path = "/sdcard" }) { Text("/sdcard") }
+                      OutlinedButton(onClick = { showMkdir = true }) { Text("Nueva carpeta") }
+                  }
+                  Button(onClick = { upload.launch(arrayOf("*/*")) }, Modifier.padding(vertical = 4.dp)) {
+                      Text("Enviar archivos aquí")
+                  }
+                  if (msg.isNotEmpty()) Text(msg, style = MaterialTheme.typography.bodySmall)
+                  LazyColumn(Modifier.fillMaxSize()) {
+                      items(entries) { e ->
+                          val isDir = e.endsWith("/")
+                          val name = e.trimEnd('/')
+                          Text(
+                              (if (isDir) "📁 " else "📄 ") + name,
+                              Modifier.fillMaxWidth()
+                                  .clickable { if (isDir) path = join(path, name) else selected = name }
+                                  .padding(vertical = 12.dp)
+                          )
+                          HorizontalDivider()
+                      }
+                  }
+              }
+
+              selected?.let { name ->
+                  val full = join(path, name)
+                  AlertDialog(
+                      onDismissRequest = { selected = null },
+                      confirmButton = { TextButton(onClick = { selected = null }) { Text("Cerrar") } },
+                      title = { Text(name, style = MaterialTheme.typography.titleSmall) },
+                      text = {
+                          Column {
+                              TextButton(onClick = { selected = null; pendingDownload = full; download.launch(name) }) {
+                                  Text("Descargar al teléfono")
+                              }
+                              TextButton(onClick = {
+                                  selected = null
+                                  scope.launch { Adb.shell("rm -rf ${Adb.q(full)}"); load() }
+                              }) { Text("Eliminar") }
+                          }
+                      }
+                  )
+              }
+
+              if (showMkdir) {
+                  AlertDialog(
+                      onDismissRequest = { showMkdir = false },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              showMkdir = false
+                              val n = newDir.trim(); newDir = ""
+                              if (n.isNotEmpty()) scope.launch { Adb.shell("mkdir -p ${Adb.q(join(path, n))}"); load() }
+                          }) { Text("Crear") }
+                      },
+                      dismissButton = { TextButton(onClick = { showMkdir = false }) { Text("Cancelar") } },
+                      title = { Text("Nueva carpeta") },
+                      text = { OutlinedTextField(newDir, { newDir = it }, singleLine = true) }
+                  )
+              }
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/MainActivity.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.launch
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { App() } } }
+              }
+          }
+
+          @Composable
+          fun App() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val prefs = remember { ctx.getSharedPreferences("tv", 0) }
+              var host by remember { mutableStateOf(prefs.getString("host", "") ?: "") }
+              var port by remember { mutableStateOf(prefs.getString("port", "5555") ?: "5555") }
+              var connected by remember { mutableStateOf(Adb.connected) }
+              var busy by remember { mutableStateOf(false) }
+              var error by remember { mutableStateOf("") }
+              var tab by remember { mutableIntStateOf(0) }
+
+              if (!connected) {
+                  Column(
+                      Modifier.fillMaxSize().padding(24.dp).systemBarsPadding(),
+                      verticalArrangement = Arrangement.Center
+                  ) {
+                      Text("TV Control", style = MaterialTheme.typography.headlineMedium)
+                      Spacer(Modifier.height(8.dp))
+                      Text("En la TV activá Depuración USB / por red (Opciones de desarrollador) y escribí su IP.")
+                      Spacer(Modifier.height(16.dp))
+                      OutlinedTextField(host, { host = it }, label = { Text("IP de la TV") },
+                          singleLine = true, modifier = Modifier.fillMaxWidth())
+                      OutlinedTextField(port, { port = it }, label = { Text("Puerto") },
+                          singleLine = true, modifier = Modifier.fillMaxWidth())
+                      Spacer(Modifier.height(12.dp))
+                      Button(
+                          enabled = !busy && host.isNotBlank(),
+                          onClick = {
+                              busy = true; error = ""
+                              scope.launch {
+                                  try {
+                                      Adb.connect(ctx, host.trim(), port.trim().toIntOrNull() ?: 5555)
+                                      prefs.edit().putString("host", host.trim()).putString("port", port.trim()).apply()
+                                      connected = true
+                                  } catch (e: Throwable) {
+                                      error = "No se pudo conectar: ${e.message}"
+                                  }
+                                  busy = false
+                              }
+                          }
+                      ) { Text(if (busy) "Conectando… (aceptá el aviso en la TV)" else "Conectar") }
+                      if (error.isNotEmpty()) {
+                          Spacer(Modifier.height(8.dp))
+                          Text(error, color = MaterialTheme.colorScheme.error)
+                      }
+                  }
+                  return
+              }
+
+              val tabs = listOf("📦" to "Apps", "📁" to "Archivos", "🎮" to "Remoto", "📊" to "Monitor", "⌨" to "Shell")
+              Scaffold(
+                  topBar = {
+                      Row(
+                          Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 4.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                          horizontalArrangement = Arrangement.SpaceBetween
+                      ) {
+                          Text("Conectado a $host", style = MaterialTheme.typography.titleSmall)
+                          TextButton(onClick = { Adb.disconnect(); connected = false }) { Text("Desconectar") }
+                      }
+                  },
+                  bottomBar = {
+                      NavigationBar {
+                          tabs.forEachIndexed { i, (icon, label) ->
+                              NavigationBarItem(
+                                  selected = tab == i, onClick = { tab = i },
+                                  icon = { Text(icon) }, label = { Text(label) }
+                              )
+                          }
+                      }
+                  }
+              ) { pad ->
+                  Box(Modifier.padding(pad).fillMaxSize()) {
+                      when (tab) {
+                          0 -> AppsScreen()
+                          1 -> FilesScreen()
+                          2 -> RemoteScreen()
+                          3 -> MonitorScreen()
+                          else -> ShellScreen()
+                      }
+                  }
+              }
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/MonitorShellScreens.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+
+          @Composable
+          fun MonitorScreen() {
+              val scope = rememberCoroutineScope()
+              var ram by remember { mutableStateOf("…") }
+              var cpu by remember { mutableStateOf("…") }
+              var disk by remember { mutableStateOf("…") }
+              var procs by remember { mutableStateOf(listOf<String>()) }
+              var auto by remember { mutableStateOf(true) }
+
+              suspend fun refresh() {
+                  try {
+                      val mem = Adb.shell("cat /proc/meminfo")
+                      fun kb(k: String) = Regex("$k:\\s+(\\d+)").find(mem)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                      val total = kb("MemTotal"); val avail = kb("MemAvailable")
+                      ram = "${(total - avail) / 1024} MB usados de ${total / 1024} MB"
+                      cpu = Adb.shell("top -n 1 -b 2>/dev/null | head -n 5").trim().ifEmpty { "No disponible" }
+                      disk = Adb.shell("df -h /data /sdcard 2>/dev/null").trim()
+                      procs = Adb.shell("ps -A -o USER,PID,NAME").lines()
+                          .map { it.trim().split(Regex("\\s+")) }
+                          .filter { it.size >= 3 && it[0].startsWith("u0_a") && it[2].contains('.') }
+                          .map { it[2] }.distinct().sorted()
+                  } catch (e: Throwable) { cpu = "Error: ${e.message}" }
+              }
+
+              LaunchedEffect(auto) {
+                  while (auto) { refresh(); delay(4000) }
+                  if (!auto) refresh()
+              }
+
+              Column(Modifier.fillMaxSize().padding(12.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Checkbox(auto, { auto = it }); Text("Actualizar cada 4 s")
+                      Spacer(Modifier.width(8.dp))
+                      OutlinedButton(onClick = { scope.launch { refresh() } }) { Text("Ahora") }
+                  }
+                  Text("RAM: $ram", style = MaterialTheme.typography.titleSmall)
+                  Text(cpu, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                  Text(disk, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                  Spacer(Modifier.height(8.dp))
+                  Text("Apps en ejecución (tocá Detener):", style = MaterialTheme.typography.titleSmall)
+                  LazyColumn(Modifier.fillMaxSize()) {
+                      items(procs) { p ->
+                          Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                              Text(p, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                              TextButton(onClick = {
+                                  scope.launch { Adb.shell("am force-stop ${Adb.q(p)}"); refresh() }
+                              }) { Text("Detener") }
+                          }
+                          HorizontalDivider()
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ShellScreen() {
+              val scope = rememberCoroutineScope()
+              var cmd by remember { mutableStateOf("") }
+              var log by remember { mutableStateOf("") }
+              var running by remember { mutableStateOf(false) }
+
+              Column(Modifier.fillMaxSize().padding(12.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      OutlinedTextField(cmd, { cmd = it }, label = { Text("Comando shell") },
+                          singleLine = true, modifier = Modifier.weight(1f))
+                      Button(enabled = !running && cmd.isNotBlank(), onClick = {
+                          val c = cmd; running = true
+                          scope.launch {
+                              val out = try { Adb.shell(c) } catch (e: Throwable) { "Error: ${e.message}" }
+                              log = "$ $c\n$out\n$log"
+                              running = false
+                          }
+                      }) { Text("Ejecutar") }
+                  }
+                  TextButton(onClick = { log = "" }) { Text("Limpiar") }
+                  Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                      Text(log, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                  }
+              }
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/RemoteScreen.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import android.graphics.BitmapFactory
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.launch
+
+          @Composable
+          fun RemoteScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var text by remember { mutableStateOf("") }
+              var msg by remember { mutableStateOf("") }
+              var shot by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+              var confirmReboot by remember { mutableStateOf(false) }
+
+              fun key(code: Int) = scope.launch {
+                  try { Adb.key(code) } catch (e: Throwable) { msg = "Error: ${e.message}" }
+              }
+
+              @Composable
+              fun K(label: String, code: Int, mod: Modifier = Modifier) =
+                  Button(onClick = { key(code) }, mod, contentPadding = PaddingValues(horizontal = 12.dp)) { Text(label) }
+
+              Column(
+                  Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.spacedBy(8.dp)
+              ) {
+                  // D-pad
+                  K("▲", 19)
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { K("◀", 21); K("OK", 23); K("▶", 22) }
+                  K("▼", 20)
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { K("Atrás", 4); K("Inicio", 3); K("Menú", 82) }
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { K("Vol −", 25); K("Mute", 164); K("Vol +", 24) }
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { K("⏮", 88); K("⏯", 85); K("⏭", 87) }
+
+                  // Texto desde el teléfono
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      OutlinedTextField(text, { text = it }, label = { Text("Texto para la TV") },
+                          singleLine = true, modifier = Modifier.weight(1f))
+                      Button(onClick = {
+                          val t = text
+                          scope.launch {
+                              try {
+                                  // 'input text' usa %s para el espacio; el resto va entre comillas simples
+                                  Adb.shell("input text ${Adb.q(t.replace(" ", "%s"))}")
+                                  text = ""
+                              } catch (e: Throwable) { msg = "Error: ${e.message}" }
+                          }
+                      }) { Text("Enviar") }
+                  }
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { K("⌫", 67); K("Enter", 66) }
+
+                  HorizontalDivider()
+
+                  // Captura de pantalla
+                  Button(onClick = {
+                      scope.launch {
+                          msg = "Capturando…"
+                          try {
+                              Adb.shell("screencap -p /sdcard/.tvc_shot.png")
+                              val f = cacheFile(ctx, "shot.png")
+                              Adb.pull(f, "/sdcard/.tvc_shot.png")
+                              Adb.shell("rm /sdcard/.tvc_shot.png")
+                              shot = BitmapFactory.decodeFile(f.path)?.asImageBitmap()
+                              msg = if (shot == null) "No se pudo leer la captura" else ""
+                          } catch (e: Throwable) { msg = "Error: ${e.message}" }
+                      }
+                  }) { Text("📸 Captura de pantalla") }
+                  shot?.let { Image(it, contentDescription = "Captura de la TV", modifier = Modifier.fillMaxWidth()) }
+
+                  HorizontalDivider()
+
+                  // Energía
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      OutlinedButton(onClick = { key(26) }) { Text("Encender/Apagar") }
+                      OutlinedButton(onClick = { confirmReboot = true }) { Text("Reiniciar") }
+                  }
+                  if (msg.isNotEmpty()) Text(msg, style = MaterialTheme.typography.bodySmall)
+              }
+
+              if (confirmReboot) {
+                  AlertDialog(
+                      onDismissRequest = { confirmReboot = false },
+                      title = { Text("¿Reiniciar la TV?") },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              confirmReboot = false
+                              scope.launch { runCatching { Adb.shell("reboot") }; Adb.disconnect() }
+                          }) { Text("Reiniciar") }
+                      },
+                      dismissButton = { TextButton(onClick = { confirmReboot = false }) { Text("Cancelar") } }
+                  )
+              }
+          }
+          TVEOF
+          cat > build.gradle.kts <<'TVEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          TVEOF
+          cat > gradle.properties <<'TVEOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          TVEOF
+          cat > settings.gradle.kts <<'TVEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TVControl"
+          include(":app")
+          TVEOF
+
+      - name: Compilar
+        run: gradle assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TVControl-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
