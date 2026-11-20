@@ -35,7 +35,7 @@ jobs:
                   targetSdk = 34
                   // sube sola en cada compilación de GitHub, así se puede actualizar sin desinstalar
                   versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
-                  versionName = "1.0"
+                  versionName = "1.1"
               }
 
               signingConfigs {
@@ -135,10 +135,6 @@ jobs:
           import java.io.File
           import java.io.IOException
 
-          /**
-           * Capa fina sobre dadb. Todas las llamadas corren en Dispatchers.IO.
-           * Si la conexión se cae (Broken pipe, reset, etc.) se reconecta sola y repite la llamada una vez.
-           */
           object Adb {
               @Volatile
               private var dadb: Dadb? = null
@@ -150,7 +146,6 @@ jobs:
 
               val connected: Boolean get() = dadb != null
 
-              /** Estado observable por la interfaz (se actualiza también al desconectar desde la notificación). */
               var isUp by mutableStateOf(false)
                   private set
 
@@ -161,11 +156,10 @@ jobs:
                   return AdbKeyPair.read(priv, pub)
               }
 
-              /** La primera vez la TV muestra "¿Permitir depuración USB?": hay que aceptar. */
               suspend fun connect(ctx: Context, host: String, port: Int) = withContext(Dispatchers.IO) {
                   disconnect()
                   val d = Dadb.create(host, port, keys(ctx))
-                  d.shell("echo ok") // fuerza la autenticación
+                  d.shell("echo ok")
                   appCtx = ctx.applicationContext
                   this@Adb.host = host
                   this@Adb.port = port
@@ -173,7 +167,6 @@ jobs:
                   isUp = true
               }
 
-              /** Desconexión pedida por el usuario: no se reconecta sola. */
               fun disconnect() {
                   host = ""
                   runCatching { dadb?.close() }
@@ -181,7 +174,6 @@ jobs:
                   isUp = false
               }
 
-              /** Cualquier error de E/S cuenta como conexión caída, salvo un fallo de instalación del APK. */
               private fun isLinkError(e: Throwable): Boolean {
                   if (e !is IOException && e !is IllegalStateException) return false
                   val m = (e.message ?: "").lowercase()
@@ -198,7 +190,7 @@ jobs:
                       val fresh = reconnectLock.withLock {
                           val cur = dadb
                           if (cur != null && cur !== first) {
-                              cur // otra llamada ya reconectó
+                              cur
                           } else {
                               runCatching { first.close() }
                               val d = Dadb.create(host, port, keys(ctx))
@@ -215,7 +207,6 @@ jobs:
 
               suspend fun shell(cmd: String): String = call { it.shell(cmd).allOutput }
 
-              /** Para comandos que cortan la conexión a propósito (reiniciar): sin reconexión ni reintento. */
               suspend fun shellOnce(cmd: String): String = withContext(Dispatchers.IO) {
                   (dadb ?: error("No conectado")).shell(cmd).allOutput
               }
@@ -229,8 +220,6 @@ jobs:
               suspend fun key(code: Int) = shell("input keyevent $code")
           }
 
-          // ---------- utilidades de archivos locales / Uri ----------
-
           fun displayName(cr: ContentResolver, uri: Uri): String {
               cr.query(uri, null, null, null, null)?.use { c ->
                   val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
@@ -239,7 +228,6 @@ jobs:
               return uri.lastPathSegment?.substringAfterLast('/') ?: "archivo"
           }
 
-          /** Copia un Uri elegido con el selector del sistema a la caché de la app. */
           suspend fun copyUriToCache(ctx: Context, uri: Uri): File = withContext(Dispatchers.IO) {
               val dir = File(ctx.cacheDir, "up").apply { mkdirs() }
               val out = File(dir, displayName(ctx.contentResolver, uri))
@@ -441,10 +429,6 @@ jobs:
           import android.os.Build
           import android.os.IBinder
 
-          /**
-           * Servicio en primer plano: muestra la notificación "Conectado a …", evita que Android
-           * cierre la app en segundo plano y mantiene el wifi activo mientras hay conexión con la TV.
-           */
           class ConnService : Service() {
               private var wifiLock: WifiManager.WifiLock? = null
 
@@ -567,7 +551,7 @@ jobs:
               fun load() = scope.launch {
                   val p = UiState.filesPath
                   val out = try { Adb.shell("ls -1Ap ${Adb.q(p)} 2>&1") } catch (e: Throwable) { "Error: ${e.message}" }
-                  if (p != UiState.filesPath) return@launch // el usuario ya cambió de carpeta
+                  if (p != UiState.filesPath) return@launch
                   if (out.contains("No such file") || out.contains("Permission denied") || out.startsWith("Error")) {
                       msg = out.trim(); entries = emptyList()
                   } else {
@@ -577,7 +561,6 @@ jobs:
                   }
               }
 
-              // Al llegar a una carpeta (o volver a ella) se restaura donde estaba el scroll.
               LaunchedEffect(entries) {
                   if (entries.isNotEmpty() && lastPath != UiState.filesPath) {
                       lastPath = UiState.filesPath
@@ -586,7 +569,6 @@ jobs:
                   }
               }
 
-              // Al cambiar de pestaña se guarda la posición para retomarla al volver.
               DisposableEffect(Unit) { onDispose { savePos() } }
 
               val upload = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -689,7 +671,6 @@ jobs:
           package com.tvcontrol
 
           import android.content.Context
-          import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
@@ -727,11 +708,6 @@ jobs:
 
           class Meta(val icon: ImageBitmap, val label: String?)
 
-          /**
-           * Obtiene el ícono y el nombre de una app instalada en la TV: baja su APK,
-           * lo lee con PackageManager y guarda el resultado en caché (no se vuelve a bajar).
-           * Se hace de a una app por vez y solo para las que se ven en pantalla.
-           */
           object IconStore {
               private val lock = Mutex()
               private val mem = ConcurrentHashMap<String, Meta>()
@@ -781,7 +757,7 @@ jobs:
                       ai.publicSourceDir = tmp.path
                       val bmp = ai.loadIcon(pm).toBitmap(96, 96)
                       val label = ai.loadLabel(pm).toString()
-                      File(dir, "$pkg.png").outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                      File(dir, "$pkg.png").outputStream().use { bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
                       File(dir, "$pkg.txt").writeText(label)
                       val meta = Meta(bmp.asImageBitmap(), label)
                       mem[pkg] = meta
@@ -880,17 +856,14 @@ jobs:
               var error by remember { mutableStateOf("") }
               var tab by remember { mutableIntStateOf(0) }
 
-              // Permiso para mostrar la notificación de conexión (Android 13+)
               val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
               LaunchedEffect(Unit) {
                   if (Build.VERSION.SDK_INT >= 33) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
               }
-              // Al desconectarse (desde la app, la notificación o por reinicio de la TV) se quita la notificación.
               LaunchedEffect(connected) {
                   if (!connected) ctx.stopService(Intent(ctx, ConnService::class.java))
               }
 
-              // Atrás: primero sube de carpeta, después vuelve a Apps; recién ahí sale de la app.
               BackHandler(enabled = connected && tab != 0) {
                   if (tab == 1 && UiState.canUp()) UiState.up() else tab = 0
               }
@@ -1115,35 +1088,39 @@ jobs:
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectDragGestures
+          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.gestures.detectVerticalDragGestures
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.Dp
           import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.Job
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withTimeoutOrNull
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.border
-          import androidx.compose.foundation.gestures.detectDragGestures
-          import androidx.compose.foundation.gestures.detectTapGestures
-          import androidx.compose.foundation.gestures.detectVerticalDragGestures
-          import androidx.compose.foundation.shape.CircleShape
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.ui.draw.clip
-          import androidx.compose.ui.input.pointer.pointerInput
-          import androidx.compose.ui.unit.sp
           import kotlin.math.abs
+          import kotlin.math.roundToInt
 
           private const val REC_PATH = "/sdcard/tvrec.mp4"
 
@@ -1158,7 +1135,7 @@ jobs:
               var recording by remember { mutableStateOf(false) }
               var busy by remember { mutableStateOf(false) }
               var small by remember { mutableStateOf(true) }
-              var mouseMode by remember { mutableStateOf(false) }
+              var mouseMode by remember { mutableStateOf(true) }
 
               LaunchedEffect(Unit) {
                   recording = try { Adb.shell("pidof screenrecord").trim().isNotEmpty() } catch (e: Throwable) { false }
@@ -1227,30 +1204,30 @@ jobs:
                   horizontalAlignment = Alignment.CenterHorizontally,
                   verticalArrangement = Arrangement.spacedBy(6.dp)
               ) {
-                  // Selector de modo
                   Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                       Btn3D("🎮 Botones", { mouseMode = false }, color = if (!mouseMode) TvBlue else TvSlate, small = true)
                       Btn3D("🖱 Ratón", { mouseMode = true }, color = if (mouseMode) TvBlue else TvSlate, small = true)
                   }
                   if (mouseMode) {
-                      MousePad { msg = it }
+                      MousePad(
+                          onMsg = { msg = it },
+                          onNavKey = { code -> key(code) }
+                      )
                   } else {
-                      // D-pad
                       K("▲", 19)
                       Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) { K("◀", 21); K("OK", 23, TvGreen); K("▶", 22) }
                       K("▼", 20)
-                  }
-                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                      K("Atrás", 4, TvSlate); K("Inicio", 3, TvSlate); K("Menú", 82, TvSlate)
-                  }
-                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                      K("Vol −", 25, TvPurple); K("Mute", 164, TvPurple); K("Vol +", 24, TvPurple)
-                  }
-                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                      K("⏮", 88, TvAmber); K("⏯", 85, TvAmber); K("⏭", 87, TvAmber)
+                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                          K("Atrás", 4, TvSlate); K("Inicio", 3, TvSlate); K("Menú", 82, TvSlate)
+                      }
+                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                          K("Vol −", 25, TvPurple); K("Mute", 164, TvPurple); K("Vol +", 24, TvPurple)
+                      }
+                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                          K("⏮", 88, TvAmber); K("⏯", 85, TvAmber); K("⏭", 87, TvAmber)
+                      }
                   }
 
-                  // Texto desde el teléfono
                   Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       OutlinedTextField(text, { text = it }, label = { Text("Texto para la TV") },
                           singleLine = true, modifier = Modifier.weight(1f))
@@ -1268,7 +1245,6 @@ jobs:
 
                   HorizontalDivider(Modifier.padding(vertical = 6.dp))
 
-                  // Captura y grabación
                   Btn3D("📸 Captura de pantalla", {
                       scope.launch {
                           msg = "Capturando…"
@@ -1298,7 +1274,6 @@ jobs:
 
                   HorizontalDivider(Modifier.padding(vertical = 6.dp))
 
-                  // Energía
                   Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                       Btn3D("Encender/Apagar", { key(26) }, color = TvAmber)
                       Btn3D("Reiniciar", { confirmReboot = true }, color = TvRed)
@@ -1321,40 +1296,44 @@ jobs:
               }
           }
 
-          /**
-           * Panel de ratón. El panel representa la pantalla de la TV (con su misma proporción):
-           *  - arrastrar con un dedo mueve el puntero (el punto verde);
-           *  - un toque = clic en la posición del puntero; mantener = clic largo;
-           *  - la franja de la derecha hace scroll al deslizar el dedo hacia arriba o abajo.
-           * Todo se manda por ADB (input tap / input swipe), así que el puntero es virtual:
-           * solo se manda algo a la TV cuando se hace clic o scroll.
-           */
           @Composable
-          fun MousePad(onMsg: (String) -> Unit) {
+          fun MousePad(
+              onMsg: (String) -> Unit,
+              onNavKey: (Int) -> Unit
+          ) {
               val scope = rememberCoroutineScope()
               var tvW by remember { mutableIntStateOf(1920) }
               var tvH by remember { mutableIntStateOf(1080) }
               var cx by remember { mutableFloatStateOf(0.5f) }
               var cy by remember { mutableFloatStateOf(0.5f) }
-              var speed by remember { mutableFloatStateOf(1.8f) }
-              var useMouse by remember { mutableStateOf(false) }
+              var speed by remember { mutableFloatStateOf(1.6f) }
               var invert by remember { mutableStateOf(false) }
               var acc by remember { mutableFloatStateOf(0f) }
+              var supportsMotionEvent by remember { mutableStateOf(true) }
+              var moveJob by remember { mutableStateOf<Job?>(null) }
+              var pendingX by remember { mutableIntStateOf(960) }
+              var pendingY by remember { mutableIntStateOf(540) }
+              var isPointerDown by remember { mutableStateOf(false) }
 
-              // Resolución real de la TV (la última cifra NxM es la que se usa si hay "Override size")
               LaunchedEffect(Unit) {
                   try {
-                      val m = Regex("""(\d+)x(\d+)""").findAll(Adb.shell("wm size")).lastOrNull()
+                      val out = Adb.shell("wm size")
+                      val m = Regex("""(\d+)x(\d+)""").findAll(out).lastOrNull()
                       if (m != null) {
                           tvW = m.groupValues[1].toInt()
                           tvH = m.groupValues[2].toInt()
+                          pendingX = tvW / 2
+                          pendingY = tvH / 2
                       }
-                  } catch (e: Throwable) { }
+                      val help = Adb.shell("input motionevent 2>&1")
+                      if (help.contains("Unknown") || help.contains("Error") || help.contains("not found")) {
+                          supportsMotionEvent = false
+                      }
+                  } catch (_: Throwable) { }
               }
 
-              fun px() = (cx * tvW).toInt().coerceIn(0, tvW - 1)
-              fun py() = (cy * tvH).toInt().coerceIn(0, tvH - 1)
-              fun src() = if (useMouse) "mouse " else ""
+              fun px() = (cx * tvW).roundToInt().coerceIn(0, tvW - 1)
+              fun py() = (cy * tvH).roundToInt().coerceIn(0, tvH - 1)
 
               fun send(cmd: String) {
                   scope.launch {
@@ -1362,111 +1341,253 @@ jobs:
                   }
               }
 
-              fun tap() = send("input ${src()}tap ${px()} ${py()}")
-              fun doubleTap() {
-                  val c = "input ${src()}tap ${px()} ${py()}"
-                  send("$c; $c")
+              fun scheduleMove(x: Int, y: Int) {
+                  pendingX = x
+                  pendingY = y
+                  if (!supportsMotionEvent) return
+                  if (moveJob?.isActive == true) return
+                  moveJob = scope.launch {
+                      delay(45)
+                      val tx = pendingX
+                      val ty = pendingY
+                      try {
+                          val action = if (isPointerDown) "MOVE" else "HOVER_MOVE"
+                          val res = Adb.shell("input motionevent $action $tx $ty 2>&1")
+                          if (res.contains("Unknown") || res.contains("Error")) {
+                              supportsMotionEvent = false
+                          }
+                      } catch (e: Throwable) {
+                          onMsg("Error: ${e.message}")
+                      }
+                  }
               }
-              fun longTap() = send("input ${src()}swipe ${px()} ${py()} ${px()} ${py()} 700")
 
-              // dir = +1: el dedo baja (se ve lo de arriba); dir = -1: el dedo sube (se ve lo de abajo)
+              fun onTouchDown() {
+                  isPointerDown = true
+                  if (supportsMotionEvent) {
+                      send("input motionevent DOWN ${px()} ${py()}")
+                  }
+              }
+
+              fun onTouchUp() {
+                  val x = px()
+                  val y = py()
+                  if (supportsMotionEvent) {
+                      send("input motionevent UP $x $y")
+                  } else {
+                      send("input tap $x $y")
+                  }
+                  isPointerDown = false
+              }
+
+              fun tap() {
+                  val x = px()
+                  val y = py()
+                  if (supportsMotionEvent) {
+                      send("input motionevent DOWN $x $y; input motionevent UP $x $y")
+                  } else {
+                      send("input tap $x $y")
+                  }
+              }
+
+              fun rightClickOrBack() {
+                  onNavKey(4)
+              }
+
               fun scrollStep(dir: Int) {
-                  val d = (tvH * 0.22f).toInt()
+                  val d = (tvH * 0.24f).toInt()
                   val x = px()
                   val y0 = (py() - dir * d / 2).coerceIn(10, tvH - 10)
                   val y1 = (y0 + dir * d).coerceIn(10, tvH - 10)
                   send("input swipe $x $y0 $x $y1 120")
               }
 
+              @Composable
+              fun QuickIconBtn(label: String, modifier: Modifier = Modifier, tint: Color = Color(0xFFE2E8F0), onClick: () -> Unit) {
+                  Box(
+                      modifier
+                          .height(44.dp)
+                          .clip(RoundedCornerShape(10.dp))
+                          .background(Color(0xFF282A36))
+                          .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
+                          .clickable(onClick = onClick),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text(label, color = tint, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                  }
+              }
+
               Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                      QuickIconBtn("🔇", Modifier.weight(1f)) { onNavKey(164) }
+                      QuickIconBtn("🔉", Modifier.weight(1f)) { onNavKey(25) }
+                      QuickIconBtn("🔊", Modifier.weight(1f)) { onNavKey(24) }
+                      QuickIconBtn("⏮", Modifier.weight(1f)) { onNavKey(88) }
+                      QuickIconBtn("⏯", Modifier.weight(1f)) { onNavKey(85) }
+                      QuickIconBtn("⏭", Modifier.weight(1f)) { onNavKey(87) }
+                      QuickIconBtn("⏻", Modifier.weight(1f), tint = TvRed) { onNavKey(26) }
+                  }
+
                   BoxWithConstraints(Modifier.fillMaxWidth()) {
-                      val stripW = 56.dp
+                      val stripW = 46.dp
                       val padW = maxWidth - stripW - 8.dp
-                      val padH = padW * (tvH.toFloat() / tvW.toFloat())
+                      val padH = 310.dp
                       val shape = RoundedCornerShape(16.dp)
+
                       Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                          // Panel del puntero
                           Box(
                               Modifier
                                   .width(padW)
                                   .height(padH)
                                   .clip(shape)
-                                  .background(TvSurface)
-                                  .border(1.dp, Color.White.copy(alpha = 0.15f), shape)
+                                  .background(Color(0xFF3A3D4A))
+                                  .border(1.dp, Color.White.copy(alpha = 0.12f), shape)
                                   .pointerInput(Unit) {
-                                      detectTapGestures(onTap = { tap() }, onLongPress = { longTap() })
+                                      detectTapGestures(
+                                          onPress = {
+                                              onTouchDown()
+                                              tryAwaitRelease()
+                                              onTouchUp()
+                                          },
+                                          onTap = { tap() },
+                                          onLongPress = {
+                                              val x = px(); val y = py()
+                                              send("input swipe $x $y $x $y 700")
+                                          }
+                                      )
                                   }
                                   .pointerInput(Unit) {
-                                      detectDragGestures { change, d ->
+                                      detectDragGestures(
+                                          onDragStart = { isPointerDown = true },
+                                          onDragEnd = { isPointerDown = false },
+                                          onDragCancel = { isPointerDown = false }
+                                      ) { change, d ->
                                           change.consume()
                                           cx = (cx + d.x * speed / size.width).coerceIn(0f, 1f)
                                           cy = (cy + d.y * speed / size.height).coerceIn(0f, 1f)
+                                          scheduleMove(px(), py())
                                       }
                                   }
                           ) {
                               Text(
-                                  "Arrastrá para mover · tocá para hacer clic",
+                                  "Modo ratón",
                                   Modifier.align(Alignment.Center),
-                                  fontSize = 11.sp,
-                                  color = Color.White.copy(alpha = 0.35f)
+                                  fontSize = 14.sp,
+                                  fontWeight = FontWeight.Medium,
+                                  color = Color.White.copy(alpha = 0.45f)
                               )
                               Box(
                                   Modifier
-                                      .offset(x = padW * cx - 8.dp, y = padH * cy - 8.dp)
+                                      .align(Alignment.BottomStart)
+                                      .padding(12.dp)
+                                      .size(34.dp)
+                                      .clip(RoundedCornerShape(8.dp))
+                                      .background(Color.White.copy(alpha = 0.08f)),
+                                  contentAlignment = Alignment.Center
+                              ) {
+                                  Text("🖱", fontSize = 18.sp)
+                              }
+                              Box(
+                                  Modifier
+                                      .offset(
+                                          x = (padW - 16.dp) * cx,
+                                          y = (padH - 16.dp) * cy
+                                      )
                                       .size(16.dp)
                                       .background(TvGreen, CircleShape)
                                       .border(2.dp, Color.White, CircleShape)
                               )
                           }
-                          // Franja de scroll
-                          Box(
+
+                          Column(
                               Modifier
                                   .width(stripW)
                                   .height(padH)
                                   .clip(shape)
-                                  .background(TvSurface)
-                                  .border(1.dp, Color.White.copy(alpha = 0.15f), shape)
-                                  .pointerInput(Unit) {
-                                      val step = 48.dp.toPx()
-                                      detectVerticalDragGestures(
-                                          onDragStart = { acc = 0f },
-                                          onVerticalDrag = { change, dy ->
-                                              change.consume()
-                                              acc += dy
-                                              while (abs(acc) >= step) {
-                                                  val dir = if (acc > 0f) 1 else -1
-                                                  acc -= dir * step
-                                                  scrollStep(if (invert) -dir else dir)
-                                              }
-                                          }
-                                      )
-                                  },
-                              contentAlignment = Alignment.Center
+                                  .background(Color(0xFF282A36))
+                                  .border(1.dp, Color.White.copy(alpha = 0.08f), shape),
+                              horizontalAlignment = Alignment.CenterHorizontally,
+                              verticalArrangement = Arrangement.SpaceBetween
                           ) {
-                              Text("⇅", fontSize = 22.sp, color = Color.White.copy(alpha = 0.6f))
+                              Box(
+                                  Modifier.fillMaxWidth().height(42.dp).clickable { scrollStep(1) },
+                                  contentAlignment = Alignment.Center
+                              ) { Text("⌃", fontSize = 18.sp, color = Color.White.copy(alpha = 0.7f)) }
+
+                              Box(
+                                  Modifier
+                                      .fillMaxWidth()
+                                      .weight(1f)
+                                      .pointerInput(Unit) {
+                                          val step = 44.dp.toPx()
+                                          detectVerticalDragGestures(
+                                              onDragStart = { acc = 0f },
+                                              onVerticalDrag = { change, dy ->
+                                                  change.consume()
+                                                  acc += dy
+                                                  while (abs(acc) >= step) {
+                                                      val dir = if (acc > 0f) 1 else -1
+                                                      acc -= dir * step
+                                                      scrollStep(if (invert) -dir else dir)
+                                                  }
+                                              }
+                                          )
+                                      },
+                                  contentAlignment = Alignment.Center
+                              ) {
+                                  Box(
+                                      Modifier
+                                          .width(3.dp)
+                                          .fillMaxHeight(0.75f)
+                                          .background(Color.White.copy(alpha = 0.2f), CircleShape)
+                                  )
+                              }
+
+                              Box(
+                                  Modifier.fillMaxWidth().height(42.dp).clickable { scrollStep(-1) },
+                                  contentAlignment = Alignment.Center
+                              ) { Text("⌄", fontSize = 18.sp, color = Color.White.copy(alpha = 0.7f)) }
                           }
                       }
                   }
 
-                  Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                      Btn3D("Clic", { tap() }, color = TvGreen, small = true)
-                      Btn3D("Doble", { doubleTap() }, color = TvBlue, small = true)
-                      Btn3D("Largo", { longTap() }, color = TvAmber, small = true)
-                      Btn3D("Centrar", { cx = 0.5f; cy = 0.5f }, color = TvSlate, small = true)
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Box(
+                          Modifier
+                              .weight(1f)
+                              .height(48.dp)
+                              .clip(RoundedCornerShape(10.dp))
+                              .background(Color(0xFF3A3D4A))
+                              .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(10.dp))
+                              .clickable { tap() },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text("Clic", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                      }
+                      Box(
+                          Modifier
+                              .weight(1f)
+                              .height(48.dp)
+                              .clip(RoundedCornerShape(10.dp))
+                              .background(Color(0xFF3A3D4A))
+                              .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(10.dp))
+                              .clickable { rightClickOrBack() },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text("Atrás", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                      }
                   }
-                  Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                      Btn3D("▲ Scroll", { scrollStep(1) }, color = TvPurple, small = true)
-                      Btn3D("▼ Scroll", { scrollStep(-1) }, color = TvPurple, small = true)
-                      Btn3D("Pág ▲", { send("input keyevent 92") }, color = TvSlate, small = true)
-                      Btn3D("Pág ▼", { send("input keyevent 93") }, color = TvSlate, small = true)
+
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                      QuickIconBtn("⋮", Modifier.weight(1f)) { onNavKey(82) }
+                      QuickIconBtn("💬", Modifier.weight(1f)) { onNavKey(187) }
+                      QuickIconBtn("☰", Modifier.weight(1f)) { onNavKey(82) }
+                      QuickIconBtn("🏠", Modifier.weight(1f)) { onNavKey(3) }
+                      QuickIconBtn("‹", Modifier.weight(1f)) { onNavKey(4) }
                   }
 
                   Text("Velocidad del puntero", style = MaterialTheme.typography.bodySmall)
                   Slider(speed, { speed = it }, modifier = Modifier.fillMaxWidth(), valueRange = 0.8f..4f)
-                  Row(verticalAlignment = Alignment.CenterVertically) {
-                      Checkbox(useMouse, { useMouse = it })
-                      Text("Enviar clics como ratón (en vez de toque)", style = MaterialTheme.typography.bodySmall)
-                  }
                   Row(verticalAlignment = Alignment.CenterVertically) {
                       Checkbox(invert, { invert = it })
                       Text("Invertir dirección del scroll", style = MaterialTheme.typography.bodySmall)
@@ -1516,13 +1637,11 @@ jobs:
           val TvBg = Color(0xFF0B1220)
           val TvSurface = Color(0xFF131C31)
 
-          /** Estado que sobrevive al cambiar de pestaña. */
           object UiState {
               var filesPath by mutableStateOf("/sdcard")
               var shellLog by mutableStateOf("")
               var shellCmd by mutableStateOf("")
 
-              /** Posición de scroll (índice, desplazamiento) guardada por carpeta. */
               val positions = HashMap<String, Pair<Int, Int>>()
 
               fun canUp(): Boolean = filesPath != "/" && filesPath != "/sdcard"
@@ -1549,11 +1668,6 @@ jobs:
               )
           }
 
-          /**
-           * Botón con efecto 3D: cara con degradado y borde de luz, canto oscuro debajo
-           * y se "hunde" al presionarlo.
-           * [wide] hace que la cara ocupe todo el ancho que le da el modificador.
-           */
           @Composable
           fun Btn3D(
               text: String,
@@ -1656,7 +1770,6 @@ jobs:
 
           data class Found(val ip: String, val port: Int, val name: String? = null)
 
-          /** Prefijo de la red local (ej. "192.168.1"), o null si no hay wifi/LAN. */
           private fun localBase(): String? = try {
               NetworkInterface.getNetworkInterfaces().toList()
                   .filter { it.isUp && !it.isLoopback }
@@ -1665,11 +1778,11 @@ jobs:
                   .filterIsInstance<Inet4Address>()
                   .firstOrNull { it.isSiteLocalAddress }
                   ?.hostAddress?.substringBeforeLast('.')
-          } catch (e: Exception) { null }
+          } catch (_: Exception) { null }
 
           private fun portOpen(ip: String, port: Int, timeoutMs: Int = 700): Boolean = try {
               Socket().use { it.connect(InetSocketAddress(ip, port), timeoutMs); true }
-          } catch (e: Exception) { false }
+          } catch (_: Exception) { false }
 
           @Composable
           private fun Radar(modifier: Modifier = Modifier) {
@@ -1716,10 +1829,6 @@ jobs:
               }
           }
 
-          /**
-           * Pantalla inicial: busca sola en la red wifi los equipos con ADB por red activado
-           * (puerto 5555) y los muestra como tarjetas. También se puede conectar escribiendo la IP.
-           */
           @Composable
           fun ConnectScreen(
               savedHost: String,
@@ -1765,7 +1874,6 @@ jobs:
                   scanning = false
                   found.sortBy { it.ip.substringAfterLast('.').toIntOrNull() ?: 0 }
 
-                  // Nombres de host (si el router los publica); no bloquea la lista
                   val snap = found.toList()
                   val names = withContext(Dispatchers.IO) {
                       snap.map { f ->
