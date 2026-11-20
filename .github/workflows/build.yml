@@ -1312,10 +1312,13 @@ jobs:
               var invert by remember { mutableStateOf(false) }
               var acc by remember { mutableFloatStateOf(0f) }
               var pointerReady by remember { mutableStateOf(false) }
+              var overlayOk by remember { mutableStateOf(false) }
               var ptrOut by remember { mutableStateOf<java.io.PrintWriter?>(null) }
               var ptrSock by remember { mutableStateOf<java.net.Socket?>(null) }
               var lastMoveSent by remember { mutableLongStateOf(0L) }
+              var lastFallbackMove by remember { mutableLongStateOf(0L) }
               var scrollJob by remember { mutableStateOf<Job?>(null) }
+              var hasInputMouseMove by remember { mutableStateOf<Boolean?>(null) }
 
               fun closePtrSocket() {
                   runCatching { ptrOut?.println("H"); ptrOut?.flush() }
@@ -1324,21 +1327,23 @@ jobs:
                   ptrOut = null
                   ptrSock = null
                   pointerReady = false
+                  overlayOk = false
               }
 
               suspend fun tryConnectPtr(host: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                   try {
                       val s = java.net.Socket()
                       s.tcpNoDelay = true
-                      s.connect(java.net.InetSocketAddress(host, 15556), 600)
+                      s.connect(java.net.InetSocketAddress(host, 15556), 700)
                       val pw = java.io.PrintWriter(java.io.BufferedWriter(java.io.OutputStreamWriter(s.getOutputStream())), true)
                       pw.println("PING")
-                      s.soTimeout = 600
+                      s.soTimeout = 700
                       val resp = java.io.BufferedReader(java.io.InputStreamReader(s.getInputStream())).readLine()
-                      if (resp == "PONG") {
+                      if (resp != null && resp.startsWith("PONG")) {
                           s.soTimeout = 0
                           ptrSock = s
                           ptrOut = pw
+                          overlayOk = resp.contains("OVL=1")
                           true
                       } else {
                           s.close()
@@ -1366,9 +1371,9 @@ jobs:
                               }
                               Adb.push(dexLocal, "/data/local/tmp/tvptr.dex")
                               kotlinx.coroutines.withTimeoutOrNull(3000) {
-                                  Adb.shell("nohup env CLASSPATH=/data/local/tmp/tvptr.dex app_process / TvPointer >/dev/null 2>&1 </dev/null &")
+                                  Adb.shell("pkill -f TvPointer 2>/dev/null; nohup env CLASSPATH=/data/local/tmp/tvptr.dex app_process / TvPointer >/data/local/tmp/tvptr.log 2>&1 </dev/null &")
                               }
-                              repeat(8) {
+                              repeat(10) {
                                   if (!pointerReady) {
                                       delay(250)
                                       if (tryConnectPtr(h)) pointerReady = true
@@ -1382,6 +1387,9 @@ jobs:
                           kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                               ptrOut?.println("M ${tvW / 2} ${tvH / 2}")
                           }
+                      } else {
+                          val helpOut = runCatching { Adb.shell("input --help 2>&1") }.getOrDefault("")
+                          hasInputMouseMove = helpOut.contains("mouse")
                       }
                   } catch (_: Throwable) { }
               }
@@ -1413,15 +1421,23 @@ jobs:
 
               fun moveCursor(x: Int, y: Int) {
                   val now = System.currentTimeMillis()
-                  if (now - lastMoveSent < 16L) return
-                  lastMoveSent = now
-                  sendPtr("M $x $y")
+                  if (pointerReady && ptrOut != null) {
+                      if (now - lastMoveSent < 16L) return
+                      lastMoveSent = now
+                      sendPtr("M $x $y")
+                  } else if (hasInputMouseMove == true) {
+                      // Fallback nativo si el helper no levantó pero `input mouse move` existe en la TV
+                      if (now - lastFallbackMove < 90L) return
+                      lastFallbackMove = now
+                      sendPtr("M $x $y", "input mouse move $x $y")
+                  }
               }
 
               fun tap() {
                   val x = px()
                   val y = py()
-                  sendPtr("C $x $y", "input tap $x $y")
+                  val fb = if (hasInputMouseMove == true) "input mouse tap $x $y" else "input tap $x $y"
+                  sendPtr("C $x $y", fb)
               }
 
               fun longTap() {
@@ -1434,12 +1450,9 @@ jobs:
                   onNavKey(4)
               }
 
-              // Scroll real con rueda de ratón en el punto exacto del cursor (ideal para páginas web y listas)
-              // y fallback a DPAD paso a paso si no está el puntero activo
               fun scrollWheel(dir: Int) {
                   val x = px()
                   val y = py()
-                  // En Android MotionEvent.AXIS_VSCROLL: negativo baja la página, positivo sube
                   val vDelta = if (dir > 0) -2.5f else 2.5f
                   val keyCode = if (dir > 0) 20 else 19
                   sendPtr("S $x $y $vDelta", "input keyevent $keyCode")
@@ -1537,8 +1550,14 @@ jobs:
                                       }
                                   }
                           ) {
+                              val statusLabel = when {
+                                  pointerReady && overlayOk -> "Puntero activo (${px()}, ${py()})"
+                                  pointerReady -> "Hover activo sin flecha (${px()}, ${py()})"
+                                  hasInputMouseMove == true -> "Modo ratón ADB (${px()}, ${py()})"
+                                  else -> "Modo toque (${px()}, ${py()})"
+                              }
                               Text(
-                                  if (pointerReady) "Puntero activo (${px()}, ${py()})" else "Modo ratón (${px()}, ${py()})",
+                                  statusLabel,
                                   Modifier.align(Alignment.Center),
                                   fontSize = 13.sp,
                                   fontWeight = FontWeight.Medium,
@@ -1567,7 +1586,6 @@ jobs:
                               )
                           }
 
-                          // Franja de scroll con rueda de mouse real (AXIS_VSCROLL)
                           Column(
                               Modifier
                                   .width(stripW)
@@ -2237,6 +2255,7 @@ jobs:
           import java.io.InputStreamReader;
           import java.io.OutputStream;
           import java.lang.reflect.Method;
+          import java.net.InetSocketAddress;
           import java.net.ServerSocket;
           import java.net.Socket;
 
@@ -2247,6 +2266,7 @@ jobs:
               private static Handler mainHandler;
               private static InputManager im;
               private static Method injectMethod;
+              private static volatile boolean overlayAttached = false;
               private static float curX = 960f;
               private static float curY = 540f;
               private static long lastActivity = System.currentTimeMillis();
@@ -2265,7 +2285,6 @@ jobs:
                       stroke.setStrokeWidth(2.6f);
                       stroke.setStrokeJoin(Paint.Join.ROUND);
 
-                      // Flecha clásica de mouse (punta exacta en 0,0)
                       arrow.moveTo(0f, 0f);
                       arrow.lineTo(0f, 34f);
                       arrow.lineTo(8.5f, 26.5f);
@@ -2294,44 +2313,63 @@ jobs:
                   return (Context) getSystemContext.invoke(at);
               }
 
+              private static void tryAttachOverlay(Context ctx) {
+                  try {
+                      wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+                      if (wm == null) return;
+                      view = new PointerView(ctx);
+
+                      int[] candidateTypes = Build.VERSION.SDK_INT >= 26
+                              ? new int[]{2038, 2032, 2003, 2006, 2002}
+                              : new int[]{2003, 2006, 2002, 2005};
+
+                      for (int type : candidateTypes) {
+                          try {
+                              WindowManager.LayoutParams p = new WindowManager.LayoutParams(
+                                      48, 56,
+                                      type,
+                                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                              | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                              | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                              | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                                      PixelFormat.TRANSLUCENT
+                              );
+                              p.gravity = Gravity.TOP | Gravity.START;
+                              p.x = (int) curX;
+                              p.y = (int) curY;
+                              try {
+                                  p.getClass().getField("privateFlags").setInt(p, 0x00000010);
+                              } catch (Throwable ignored) {}
+
+                              wm.addView(view, p);
+                              lp = p;
+                              overlayAttached = true;
+                              System.out.println("TvPointer: overlay attached type=" + type);
+                              return;
+                          } catch (Throwable e) {
+                              System.out.println("TvPointer: overlay failed type=" + type + " err=" + e);
+                          }
+                      }
+                  } catch (Throwable outer) {
+                      System.out.println("TvPointer: overlay init error=" + outer);
+                  }
+              }
+
               public static void main(String[] args) {
                   try {
                       Looper.prepareMainLooper();
                       mainHandler = new Handler(Looper.getMainLooper());
 
                       Context ctx = obtainSystemContext();
-
                       im = (InputManager) ctx.getSystemService(Context.INPUT_SERVICE);
                       injectMethod = InputManager.class.getMethod("injectInputEvent", InputEvent.class, int.class);
 
-                      wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
-                      @SuppressWarnings("deprecation")
-                      int type = Build.VERSION.SDK_INT >= 26
-                              ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                              : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT;
-
-                      lp = new WindowManager.LayoutParams(
-                              48, 56,
-                              type,
-                              WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                      | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                      | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                                      | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                              PixelFormat.TRANSLUCENT
-                      );
-                      lp.gravity = Gravity.TOP | Gravity.START;
-                      lp.x = (int) curX;
-                      lp.y = (int) curY;
-                      try {
-                          lp.getClass().getField("privateFlags").setInt(lp, 0x00000010); // PRIVATE_FLAG_TRUSTED_OVERLAY
-                      } catch (Throwable ignored) {}
-
-                      view = new PointerView(ctx);
-                      wm.addView(view, lp);
-
+                      // Levantar servidor TCP primero para que nunca quede bloqueado por el overlay
                       new Thread(TvPointer::runServer, "tvptr-srv").start();
 
-                      // Auto-cierre si pasa 20 minutos sin actividad
+                      // Intentar adjuntar flecha visual con tipos de respaldo
+                      tryAttachOverlay(ctx);
+
                       mainHandler.postDelayed(new Runnable() {
                           @Override
                           public void run() {
@@ -2352,14 +2390,13 @@ jobs:
               private static void moveOverlay(final float x, final float y, final boolean visible) {
                   curX = x;
                   curY = y;
+                  if (!overlayAttached || view == null || wm == null || lp == null) return;
                   mainHandler.post(() -> {
                       try {
-                          if (view != null && wm != null) {
-                              view.setVisibility(visible ? View.VISIBLE : View.GONE);
-                              lp.x = Math.round(x) - 2;
-                              lp.y = Math.round(y) - 2;
-                              wm.updateViewLayout(view, lp);
-                          }
+                          view.setVisibility(visible ? View.VISIBLE : View.GONE);
+                          lp.x = Math.round(x) - 2;
+                          lp.y = Math.round(y) - 2;
+                          wm.updateViewLayout(view, lp);
                       } catch (Throwable ignored) {}
                   });
               }
@@ -2425,9 +2462,13 @@ jobs:
               }
 
               private static void runServer() {
-                  try (ServerSocket ss = new ServerSocket(15556)) {
+                  try (ServerSocket ss = new ServerSocket()) {
+                      ss.setReuseAddress(true);
+                      ss.bind(new InetSocketAddress(15556));
+                      System.out.println("TvPointer: listening on 15556");
                       while (true) {
                           Socket s = ss.accept();
+                          s.setTcpNoDelay(true);
                           new Thread(() -> handleClient(s)).start();
                       }
                   } catch (Throwable t) {
@@ -2446,7 +2487,8 @@ jobs:
                           if (p.length == 0) continue;
                           switch (p[0]) {
                               case "PING":
-                                  out.write("PONG\n".getBytes());
+                                  String pong = "PONG OVL=" + (overlayAttached ? "1" : "0") + "\n";
+                                  out.write(pong.getBytes());
                                   out.flush();
                                   break;
                               case "M":
