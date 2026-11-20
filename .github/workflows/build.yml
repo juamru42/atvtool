@@ -1400,10 +1400,18 @@ jobs:
           import java.net.InetSocketAddress
           import java.net.Socket
           import java.util.UUID
+          import kotlin.math.abs
+          import kotlin.math.hypot
 
           private const val SERVICE = "com.tvcontrol/com.tvcontrol.PointerService"
 
-          /** Conexión abierta con el puntero de la TV. Los comandos se juntan y se envían en segundo plano. */
+          private const val SCROLL_GAIN = 3f
+
+          /**
+           * Conexión abierta con el puntero de la TV. La flecha se dibuja en la TV por este canal;
+           * los toques, el scroll y los botones se mandan por ADB (input tap / swipe / keyevent),
+           * que es lo que la TV acepta.
+           */
           class PointerSession(
               private val sock: Socket,
               val w: Int,
@@ -1422,6 +1430,10 @@ jobs:
 
               private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
               private val ch = Channel<String>(Channel.UNLIMITED)
+              private val lock = Any()
+              private var accX = 0f
+              private var accY = 0f
+              private var scrolling = false
 
               init {
                   scope.launch {
@@ -1435,38 +1447,25 @@ jobs:
                                   batch.add(n)
                               }
                               val sb = StringBuilder()
-                              var mdx = 0f
-                              var mdy = 0f
-                              var wdx = 0f
-                              var wdy = 0f
+                              var ax = 0f
+                              var ay = 0f
+                              var hasA = false
                               for (c in batch) {
-                                  val p = c.split(' ')
-                                  when (p[0]) {
-                                      "M" -> {
-                                          mdx += p[1].toFloat()
-                                          mdy += p[2].toFloat()
+                                  if (c.startsWith("A ")) {
+                                      // posición absoluta: solo importa la última
+                                      val p = c.split(' ')
+                                      ax = p[1].toFloat()
+                                      ay = p[2].toFloat()
+                                      hasA = true
+                                  } else {
+                                      if (hasA) {
+                                          sb.append("A ").append(ax).append(' ').append(ay).append('\n')
+                                          hasA = false
                                       }
-                                      "W" -> {
-                                          wdx += p[1].toFloat()
-                                          wdy += p[2].toFloat()
-                                      }
-                                      else -> {
-                                          if (mdx != 0f || mdy != 0f) {
-                                              sb.append("M ").append(mdx).append(' ').append(mdy).append('\n')
-                                              mdx = 0f
-                                              mdy = 0f
-                                          }
-                                          if (wdx != 0f || wdy != 0f) {
-                                              sb.append("W ").append(wdx).append(' ').append(wdy).append('\n')
-                                              wdx = 0f
-                                              wdy = 0f
-                                          }
-                                          sb.append(c).append('\n')
-                                      }
+                                      sb.append(c).append('\n')
                                   }
                               }
-                              if (mdx != 0f || mdy != 0f) sb.append("M ").append(mdx).append(' ').append(mdy).append('\n')
-                              if (wdx != 0f || wdy != 0f) sb.append("W ").append(wdx).append(' ').append(wdy).append('\n')
+                              if (hasA) sb.append("A ").append(ax).append(' ').append(ay).append('\n')
                               out.write(sb.toString().toByteArray())
                               out.flush()
                           }
@@ -1480,11 +1479,110 @@ jobs:
                   ch.trySend(cmd)
               }
 
-              /** Mueve el puntero (en píxeles de la TV) y recuerda su posición para dibujarlo en el teléfono. */
+              /** Mueve el puntero (en píxeles de la TV) y lo dibuja en la TV y en el teléfono. */
               fun move(dx: Float, dy: Float) {
                   x = (x + dx).coerceIn(0f, w - 1f)
                   y = (y + dy).coerceIn(0f, h - 1f)
-                  ch.trySend("M $dx $dy")
+                  ch.trySend("A $x $y")
+              }
+
+              private fun run(cmd: String) {
+                  scope.launch {
+                      try {
+                          Adb.shell(cmd)
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              fun click() {
+                  ch.trySend("F")
+                  run("input tap ${x.toInt()} ${y.toInt()}")
+              }
+
+              fun longClick() {
+                  ch.trySend("F")
+                  val px = x.toInt()
+                  val py = y.toInt()
+                  run("input swipe $px $py $px $py 800")
+              }
+
+              fun key(name: String) {
+                  val code = when (name) {
+                      "back" -> 4
+                      "home" -> 3
+                      "recents" -> 187
+                      else -> return
+                  }
+                  run("input keyevent $code")
+              }
+
+              fun page(up: Boolean) {
+                  val vy = 0.55f * h
+                  scope.launch { swipeBy(0f, if (up) vy else -vy, 350) }
+              }
+
+              /** Scroll: junta lo que se desliza y lo manda como deslizamientos desde el puntero. */
+              fun scroll(dx: Float, dy: Float) {
+                  synchronized(lock) {
+                      accX += dx
+                      accY += dy
+                      if (scrolling) return
+                      scrolling = true
+                  }
+                  scope.launch {
+                      try {
+                          var idle = 0
+                          while (true) {
+                              delay(90)
+                              var vx = 0f
+                              var vy = 0f
+                              synchronized(lock) {
+                                  vx = accX
+                                  vy = accY
+                              }
+                              if (abs(vx) + abs(vy) >= 6f) {
+                                  synchronized(lock) {
+                                      accX -= vx
+                                      accY -= vy
+                                  }
+                                  idle = 0
+                                  swipeBy(vx * SCROLL_GAIN, vy * SCROLL_GAIN, 220)
+                              } else {
+                                  idle++
+                                  if (idle >= 3) {
+                                      synchronized(lock) {
+                                          accX = 0f
+                                          accY = 0f
+                                      }
+                                      break
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                      } finally {
+                          synchronized(lock) { scrolling = false }
+                      }
+                  }
+              }
+
+              /** Desliza un "dedo" (vx, vy) desde el puntero, ajustando el inicio para no salirse de la pantalla. */
+              private suspend fun swipeBy(vxIn: Float, vyIn: Float, dur: Int) {
+                  val maxLen = 0.6f * minOf(w, h)
+                  val len = hypot(vxIn, vyIn)
+                  var vx = vxIn
+                  var vy = vyIn
+                  if (len > maxLen) {
+                      val k = maxLen / len
+                      vx *= k
+                      vy *= k
+                  }
+                  val sx = x.coerceIn(maxOf(0f, -vx), minOf(w - 1f, w - 1f - vx))
+                  val sy = y.coerceIn(maxOf(0f, -vy), minOf(h - 1f, h - 1f - vy))
+                  try {
+                      Adb.shell("input swipe ${sx.toInt()} ${sy.toInt()} ${(sx + vx).toInt()} ${(sy + vy).toInt()} $dur")
+                  } catch (e: Exception) {
+                  }
               }
 
               fun close() {
@@ -1782,6 +1880,16 @@ jobs:
                           val dy = p[2].toFloatOrNull() ?: 0f
                           ui.post { move(dx, dy) }
                       }
+                      "A" -> if (p.size >= 3) {
+                          val ax = p[1].toFloatOrNull() ?: 0f
+                          val ay = p[2].toFloatOrNull() ?: 0f
+                          ui.post {
+                              cx = ax.coerceIn(0f, sw - 1f)
+                              cy = ay.coerceIn(0f, sh - 1f)
+                              cursor?.setPos(cx, cy)
+                          }
+                      }
+                      "F" -> ui.post { cursor?.flash() }
                       "T" -> ui.post {
                           tap(70L)
                           cursor?.flash()
@@ -2429,14 +2537,14 @@ jobs:
                       )
                   }
                   Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                      Btn3D("◀ Atrás", { session?.send("K back") }, color = TvSlate, small = true)
-                      Btn3D("🏠 Inicio", { session?.send("K home") }, color = TvSlate, small = true)
-                      Btn3D("▤ Recientes", { session?.send("K recents") }, color = TvSlate, small = true)
+                      Btn3D("◀ Atrás", { session?.key("back") }, color = TvSlate, small = true)
+                      Btn3D("🏠 Inicio", { session?.key("home") }, color = TvSlate, small = true)
+                      Btn3D("▤ Recientes", { session?.key("recents") }, color = TvSlate, small = true)
                   }
                   Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                      Btn3D("⬆ Subir pág.", { session?.send("P up") }, color = TvPurple, small = true)
-                      Btn3D("⬇ Bajar pág.", { session?.send("P down") }, color = TvPurple, small = true)
-                      Btn3D("Clic", { session?.send("T") }, color = TvBlue, small = true)
+                      Btn3D("⬆ Subir pág.", { session?.page(true) }, color = TvPurple, small = true)
+                      Btn3D("⬇ Bajar pág.", { session?.page(false) }, color = TvPurple, small = true)
+                      Btn3D("Clic", { session?.click() }, color = TvBlue, small = true)
                   }
                   TextButton(onClick = {
                       scope.launch {
@@ -2483,7 +2591,7 @@ jobs:
                                   if (ev == null) {
                                       // se mantuvo apretado sin moverse: clic largo
                                       longDone = true
-                                      sess?.send("L")
+                                      sess?.longClick()
                                       haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                       continue
                                   }
@@ -2512,7 +2620,7 @@ jobs:
                                   val s = sess
                                   if (s != null && !longDone) {
                                       if (pressed.size >= 2) {
-                                          if (moved >= 4f) s.send("W $dx $dy")
+                                          if (moved >= 4f) s.scroll(dx, dy)
                                       } else if (maxPtr == 1 && moved >= slop) {
                                           s.move(dx * spd, dy * spd)
                                           redraw++
@@ -2522,7 +2630,7 @@ jobs:
                               }
                               // al soltar: un toque corto y quieto es un clic
                               if (!longDone && maxPtr == 1 && moved < 20f && lastT - t0 < 400L) {
-                                  sess?.send("T")
+                                  sess?.click()
                               }
                           }
                       }
@@ -2585,7 +2693,7 @@ jobs:
                       .pointerInput(Unit) {
                           detectVerticalDragGestures { change, dragAmount ->
                               change.consume()
-                              sess?.send("W 0 $dragAmount")
+                              sess?.scroll(0f, dragAmount)
                           }
                       },
                   contentAlignment = Alignment.Center
