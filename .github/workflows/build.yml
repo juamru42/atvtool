@@ -176,9 +176,24 @@ jobs:
               }
 
               private fun isLinkError(e: Throwable): Boolean {
-                  if (e !is IOException && e !is IllegalStateException) return false
-                  val m = (e.message ?: "").lowercase()
-                  return !(m.contains("failure") || m.contains("install_"))
+                  if (e is CancellationException) return false
+                  val m = ((e.message ?: "") + " " + (e.cause?.message ?: "")).lowercase()
+                  if (m.contains("failure") || m.contains("install_")) return false
+                  return e is IOException || e is IllegalStateException ||
+                      m.contains("closed") || m.contains("eof") || m.contains("broken pipe") ||
+                      m.contains("reset") || m.contains("timeout") || m.contains("stream")
+              }
+
+              suspend fun reconnect(): Unit = withContext(Dispatchers.IO) {
+                  val ctx = appCtx ?: error("Sin contexto")
+                  if (host.isEmpty()) error("No conectado")
+                  reconnectLock.withLock {
+                      runCatching { dadb?.close() }
+                      val d = Dadb.create(host, port, keys(ctx))
+                      d.shell("echo ok")
+                      dadb = d
+                      isUp = true
+                  }
               }
 
               private suspend fun <T> call(block: (Dadb) -> T): T = withContext(Dispatchers.IO) {
@@ -1015,6 +1030,7 @@ jobs:
                   mutableStateOf((prefs.getString("marks", "") ?: "").lines().filter { it.isNotBlank() })
               }
               var running by remember { mutableStateOf(false) }
+              var activeJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
               fun saveMarks(l: List<String>) {
                   marks = l
@@ -1022,12 +1038,31 @@ jobs:
               }
 
               fun exec(c: String) {
-                  if (c.isBlank() || running) return
+                  if (c.isBlank()) return
+                  activeJob?.cancel()
                   running = true
-                  scope.launch {
-                      val out = try { Adb.shell(c) } catch (e: Throwable) { "Error: ${e.message}" }
-                      UiState.shellLog = "$ $c\n$out\n${UiState.shellLog}"
-                      running = false
+                  activeJob = scope.launch {
+                      try {
+                          val out = kotlinx.coroutines.withTimeoutOrNull(15_000L) {
+                              try {
+                                  Adb.shell(c)
+                              } catch (e: Throwable) {
+                                  if (e is kotlinx.coroutines.CancellationException) throw e
+                                  runCatching { Adb.reconnect() }
+                                  Adb.shell(c)
+                              }
+                          } ?: "Timeout (15 s): el comando siguió abierto o no respondió. Reconectando ADB…"
+                          if (out.startsWith("Timeout (15 s)")) {
+                              runCatching { Adb.reconnect() }
+                          }
+                          UiState.shellLog = "$ $c\n$out\n${UiState.shellLog}"
+                      } catch (e: kotlinx.coroutines.CancellationException) {
+                          UiState.shellLog = "$ $c\n[Cancelado]\n${UiState.shellLog}"
+                      } catch (e: Throwable) {
+                          UiState.shellLog = "$ $c\nError: ${e.message}\n${UiState.shellLog}"
+                      } finally {
+                          running = false
+                      }
                   }
               }
 
@@ -1035,7 +1070,15 @@ jobs:
                   Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       OutlinedTextField(UiState.shellCmd, { UiState.shellCmd = it }, label = { Text("Comando shell") },
                           singleLine = true, modifier = Modifier.weight(1f))
-                      Btn3D("Ejecutar", { exec(UiState.shellCmd) }, color = TvGreen, enabled = !running && UiState.shellCmd.isNotBlank(), small = true)
+                      if (running) {
+                          Btn3D("Detener", {
+                              activeJob?.cancel()
+                              running = false
+                              scope.launch { runCatching { Adb.reconnect() } }
+                          }, color = TvRed, small = true)
+                      } else {
+                          Btn3D("Ejecutar", { exec(UiState.shellCmd) }, color = TvGreen, enabled = UiState.shellCmd.isNotBlank(), small = true)
+                      }
                   }
                   Spacer(Modifier.height(8.dp))
                   Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1313,6 +1356,7 @@ jobs:
               var acc by remember { mutableFloatStateOf(0f) }
               var pointerReady by remember { mutableStateOf(false) }
               var overlayOk by remember { mutableStateOf(false) }
+              var activePort by remember { mutableIntStateOf(15556) }
               var ptrOut by remember { mutableStateOf<java.io.PrintWriter?>(null) }
               var ptrSock by remember { mutableStateOf<java.net.Socket?>(null) }
               var lastMoveSent by remember { mutableLongStateOf(0L) }
@@ -1330,28 +1374,28 @@ jobs:
                   overlayOk = false
               }
 
-              suspend fun tryConnectPtr(host: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                  try {
-                      val s = java.net.Socket()
-                      s.tcpNoDelay = true
-                      s.connect(java.net.InetSocketAddress(host, 15556), 700)
-                      val pw = java.io.PrintWriter(java.io.BufferedWriter(java.io.OutputStreamWriter(s.getOutputStream())), true)
-                      pw.println("PING")
-                      s.soTimeout = 700
-                      val resp = java.io.BufferedReader(java.io.InputStreamReader(s.getInputStream())).readLine()
-                      if (resp != null && resp.startsWith("PONG")) {
-                          s.soTimeout = 0
-                          ptrSock = s
-                          ptrOut = pw
-                          overlayOk = resp.contains("OVL=1")
-                          true
-                      } else {
-                          s.close()
-                          false
-                      }
-                  } catch (_: Throwable) {
-                      false
+              suspend fun tryConnectAnyPort(host: String): Int? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                  for (port in 15556..15565) {
+                      try {
+                          val s = java.net.Socket()
+                          s.tcpNoDelay = true
+                          s.connect(java.net.InetSocketAddress(host, port), 500)
+                          val pw = java.io.PrintWriter(java.io.BufferedWriter(java.io.OutputStreamWriter(s.getOutputStream())), true)
+                          pw.println("PING")
+                          s.soTimeout = 500
+                          val resp = java.io.BufferedReader(java.io.InputStreamReader(s.getInputStream())).readLine()
+                          if (resp != null && resp.startsWith("PONG")) {
+                              s.soTimeout = 0
+                              ptrSock = s
+                              ptrOut = pw
+                              overlayOk = resp.contains("OVL=1")
+                              return@withContext port
+                          } else {
+                              s.close()
+                          }
+                      } catch (_: Throwable) { }
                   }
+                  null
               }
 
               LaunchedEffect(Unit) {
@@ -1364,23 +1408,29 @@ jobs:
                       }
                       val h = Adb.host
                       if (h.isNotEmpty()) {
-                          if (!tryConnectPtr(h)) {
+                          val existing = tryConnectAnyPort(h)
+                          if (existing != null) {
+                              activePort = existing
+                              pointerReady = true
+                          } else {
                               val dexLocal = java.io.File(ctx.cacheDir, "tvptr.dex")
                               ctx.assets.open("tvptr.dex").use { inp ->
                                   dexLocal.outputStream().use { outStr -> inp.copyTo(outStr) }
                               }
                               Adb.push(dexLocal, "/data/local/tmp/tvptr.dex")
                               kotlinx.coroutines.withTimeoutOrNull(3000) {
-                                  Adb.shell("pkill -f TvPointer 2>/dev/null; nohup env CLASSPATH=/data/local/tmp/tvptr.dex app_process / TvPointer >/data/local/tmp/tvptr.log 2>&1 </dev/null &")
+                                  Adb.shell("nohup env CLASSPATH=/data/local/tmp/tvptr.dex app_process / TvPointer >/data/local/tmp/tvptr.log 2>&1 </dev/null &")
                               }
-                              repeat(10) {
+                              repeat(12) {
                                   if (!pointerReady) {
                                       delay(250)
-                                      if (tryConnectPtr(h)) pointerReady = true
+                                      val foundPort = tryConnectAnyPort(h)
+                                      if (foundPort != null) {
+                                          activePort = foundPort
+                                          pointerReady = true
+                                      }
                                   }
                               }
-                          } else {
-                              pointerReady = true
                           }
                       }
                       if (pointerReady) {
@@ -1426,7 +1476,6 @@ jobs:
                       lastMoveSent = now
                       sendPtr("M $x $y")
                   } else if (hasInputMouseMove == true) {
-                      // Fallback nativo si el helper no levantó pero `input mouse move` existe en la TV
                       if (now - lastFallbackMove < 90L) return
                       lastFallbackMove = now
                       sendPtr("M $x $y", "input mouse move $x $y")
@@ -1551,8 +1600,8 @@ jobs:
                                   }
                           ) {
                               val statusLabel = when {
-                                  pointerReady && overlayOk -> "Puntero activo (${px()}, ${py()})"
-                                  pointerReady -> "Hover activo sin flecha (${px()}, ${py()})"
+                                  pointerReady && overlayOk -> "Puntero :$activePort (${px()}, ${py()})"
+                                  pointerReady -> "Hover :$activePort sin flecha (${px()}, ${py()})"
                                   hasInputMouseMove == true -> "Modo ratón ADB (${px()}, ${py()})"
                                   else -> "Modo toque (${px()}, ${py()})"
                               }
@@ -2462,10 +2511,25 @@ jobs:
               }
 
               private static void runServer() {
-                  try (ServerSocket ss = new ServerSocket()) {
-                      ss.setReuseAddress(true);
-                      ss.bind(new InetSocketAddress(15556));
-                      System.out.println("TvPointer: listening on 15556");
+                  ServerSocket bound = null;
+                  int boundPort = -1;
+                  for (int port = 15556; port <= 15565; port++) {
+                      try {
+                          ServerSocket ss = new ServerSocket();
+                          ss.setReuseAddress(true);
+                          ss.bind(new InetSocketAddress(port));
+                          bound = ss;
+                          boundPort = port;
+                          break;
+                      } catch (Throwable ignored) { }
+                  }
+                  if (bound == null) {
+                      System.out.println("TvPointer: no free port in 15556..15565");
+                      System.exit(1);
+                      return;
+                  }
+                  System.out.println("TvPointer: listening on " + boundPort);
+                  try (ServerSocket ss = bound) {
                       while (true) {
                           Socket s = ss.accept();
                           s.setTcpNoDelay(true);
