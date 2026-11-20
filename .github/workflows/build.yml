@@ -1502,9 +1502,11 @@ jobs:
               fun scrollWheel(dir: Int) {
                   val x = px()
                   val y = py()
-                  val vDelta = if (dir > 0) -2.5f else 2.5f
-                  val keyCode = if (dir > 0) 20 else 19
-                  sendPtr("S $x $y $vDelta", "input keyevent $keyCode")
+                  val vDelta = if (dir > 0) -3.0f else 3.0f
+                  val d = (tvH * 0.16f).toInt()
+                  val yStart = (y + dir * d / 2).coerceIn(60, tvH - 60)
+                  val yEnd = (y - dir * d / 2).coerceIn(60, tvH - 60)
+                  sendPtr("S $x $y $vDelta", "input swipe $x $yStart $x $yEnd 220")
               }
 
               fun scrollSwipe(dir: Int) {
@@ -2278,6 +2280,348 @@ jobs:
           include(":app")
           TVEOF
           base64 -d app/tvcontrol.keystore.b64 > app/tvcontrol.keystore
+
+      - name: Compilar helper de puntero para la TV
+        run: |
+          mkdir -p ptr_src app/src/main/assets
+          cat > ptr_src/TvPointer.java <<'PTREOF'
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.PixelFormat;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.input.InputManager;
+          import android.os.Binder;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.view.Display;
+          import android.view.Gravity;
+          import android.view.InputDevice;
+          import android.view.InputEvent;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.lang.reflect.Method;
+          import java.net.InetSocketAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+
+          public class TvPointer {
+              private static WindowManager wm;
+              private static PointerView view;
+              private static WindowManager.LayoutParams lp;
+              private static Handler mainHandler;
+              private static InputManager im;
+              private static Method injectMethod;
+              private static volatile boolean overlayAttached = false;
+              private static float curX = 960f;
+              private static float curY = 540f;
+              private static long lastActivity = System.currentTimeMillis();
+
+              static class PointerView extends View {
+                  private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Path arrow = new Path();
+
+                  public PointerView(Context ctx) {
+                      super(ctx);
+                      fill.setColor(Color.WHITE);
+                      fill.setStyle(Paint.Style.FILL);
+                      stroke.setColor(Color.BLACK);
+                      stroke.setStyle(Paint.Style.STROKE);
+                      stroke.setStrokeWidth(3f);
+                      stroke.setStrokeJoin(Paint.Join.ROUND);
+
+                      arrow.moveTo(0f, 0f);
+                      arrow.lineTo(0f, 36f);
+                      arrow.lineTo(9f, 28f);
+                      arrow.lineTo(15.5f, 41f);
+                      arrow.lineTo(21f, 38.5f);
+                      arrow.lineTo(14.5f, 25.5f);
+                      arrow.lineTo(26f, 25.5f);
+                      arrow.close();
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas canvas) {
+                      canvas.save();
+                      canvas.translate(2f, 2f);
+                      canvas.drawPath(arrow, fill);
+                      canvas.drawPath(arrow, stroke);
+                      canvas.restore();
+                  }
+              }
+
+              private static Context obtainSystemContext() throws Exception {
+                  Class<?> atClass = Class.forName("android.app.ActivityThread");
+                  Method systemMain = atClass.getMethod("systemMain");
+                  Object at = systemMain.invoke(null);
+                  Method getSystemContext = atClass.getMethod("getSystemContext");
+                  Context sysCtx = (Context) getSystemContext.invoke(at);
+                  try {
+                      DisplayManager dm = (DisplayManager) sysCtx.getSystemService(Context.DISPLAY_SERVICE);
+                      if (dm != null) {
+                          Display d = dm.getDisplay(Display.DEFAULT_DISPLAY);
+                          if (d != null) {
+                              return sysCtx.createDisplayContext(d);
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+                  return sysCtx;
+              }
+
+              private static void tryAttachOverlay(Context ctx) {
+                  try {
+                      wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+                      if (wm == null) return;
+                      view = new PointerView(ctx);
+
+                      int[] candidateTypes = Build.VERSION.SDK_INT >= 26
+                              ? new int[]{2038, 2032, 2003, 2006, 2005, 2002}
+                              : new int[]{2003, 2006, 2005, 2002};
+
+                      Binder token = new Binder();
+                      for (int type : candidateTypes) {
+                          try {
+                              WindowManager.LayoutParams p = new WindowManager.LayoutParams(
+                                      56, 64,
+                                      type,
+                                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                              | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                              | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                              | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                                      PixelFormat.TRANSLUCENT
+                              );
+                              p.gravity = Gravity.TOP | Gravity.START;
+                              p.x = Math.round(curX);
+                              p.y = Math.round(curY);
+                              p.token = token;
+                              try {
+                                  p.getClass().getField("privateFlags").setInt(p, 0x00000010);
+                              } catch (Throwable ignored) {}
+
+                              wm.addView(view, p);
+                              lp = p;
+                              overlayAttached = true;
+                              mainHandler.post(() -> {
+                                  try {
+                                      view.setVisibility(View.VISIBLE);
+                                      view.invalidate();
+                                  } catch (Throwable ignored) {}
+                              });
+                              System.out.println("TvPointer: overlay attached type=" + type);
+                              return;
+                          } catch (Throwable e) {
+                              System.out.println("TvPointer: overlay failed type=" + type + " err=" + e);
+                          }
+                      }
+                  } catch (Throwable outer) {
+                      System.out.println("TvPointer: overlay init error=" + outer);
+                  }
+              }
+
+              public static void main(String[] args) {
+                  try {
+                      Looper.prepareMainLooper();
+                      mainHandler = new Handler(Looper.getMainLooper());
+
+                      Context ctx = obtainSystemContext();
+                      im = (InputManager) ctx.getSystemService(Context.INPUT_SERVICE);
+                      injectMethod = InputManager.class.getMethod("injectInputEvent", InputEvent.class, int.class);
+
+                      new Thread(TvPointer::runServer, "tvptr-srv").start();
+
+                      mainHandler.postDelayed(() -> tryAttachOverlay(ctx), 400L);
+
+                      mainHandler.postDelayed(new Runnable() {
+                          @Override
+                          public void run() {
+                              if (System.currentTimeMillis() - lastActivity > 20 * 60 * 1000L) {
+                                  System.exit(0);
+                              }
+                              mainHandler.postDelayed(this, 60_000L);
+                          }
+                      }, 60_000L);
+
+                      Looper.loop();
+                  } catch (Throwable t) {
+                      t.printStackTrace();
+                      System.exit(1);
+                  }
+              }
+
+              private static void moveOverlay(final float x, final float y, final boolean visible) {
+                  curX = x;
+                  curY = y;
+                  if (!overlayAttached || view == null || wm == null || lp == null) return;
+                  mainHandler.post(() -> {
+                      try {
+                          view.setVisibility(visible ? View.VISIBLE : View.GONE);
+                          lp.x = Math.round(x) - 2;
+                          lp.y = Math.round(y) - 2;
+                          wm.updateViewLayout(view, lp);
+                          view.invalidate();
+                      } catch (Throwable ignored) {}
+                  });
+              }
+
+              private static void injectMotion(int action, float x, float y, int source, int buttonState, float vScroll, long downTime) {
+                  try {
+                      long now = SystemClock.uptimeMillis();
+                      MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
+                      props[0] = new MotionEvent.PointerProperties();
+                      props[0].id = 0;
+                      props[0].toolType = (source == InputDevice.SOURCE_MOUSE)
+                              ? MotionEvent.TOOL_TYPE_MOUSE
+                              : MotionEvent.TOOL_TYPE_FINGER;
+
+                      MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
+                      coords[0] = new MotionEvent.PointerCoords();
+                      coords[0].x = x;
+                      coords[0].y = y;
+                      coords[0].pressure = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_HOVER_MOVE || action == MotionEvent.ACTION_SCROLL) ? 0f : 1f;
+                      coords[0].size = 1f;
+                      if (vScroll != 0f) {
+                          coords[0].setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll);
+                      }
+
+                      MotionEvent ev = MotionEvent.obtain(
+                              downTime, now, action,
+                              1, props, coords,
+                              0, buttonState,
+                              1f, 1f,
+                              0, 0, source, 0
+                      );
+                      injectMethod.invoke(im, ev, 0);
+                      ev.recycle();
+                  } catch (Throwable ignored) {}
+              }
+
+              private static void doHover(float x, float y) {
+                  moveOverlay(x, y, true);
+                  long now = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_HOVER_MOVE, x, y, InputDevice.SOURCE_MOUSE, 0, 0f, now);
+              }
+
+              private static void doClick(float x, float y) {
+                  moveOverlay(x, y, true);
+                  long down = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+                  SystemClock.sleep(35);
+                  injectMotion(MotionEvent.ACTION_UP, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+              }
+
+              private static void doLongClick(float x, float y) {
+                  moveOverlay(x, y, true);
+                  long down = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+                  SystemClock.sleep(650);
+                  injectMotion(MotionEvent.ACTION_UP, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+              }
+
+              private static void doWheelScroll(float x, float y, float delta) {
+                  moveOverlay(x, y, true);
+                  long now = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_HOVER_MOVE, x, y, InputDevice.SOURCE_MOUSE, 0, 0f, now);
+                  injectMotion(MotionEvent.ACTION_SCROLL, x, y, InputDevice.SOURCE_MOUSE, 0, delta, now);
+                  // Respaldo de desplazamiento táctil corto en la coordenada del puntero para vistas/TVs que ignoran AXIS_VSCROLL
+                  float dy = delta > 0 ? -120f : 120f;
+                  float yEnd = Math.max(20f, Math.min(2160f, y + dy));
+                  long down = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+                  int steps = 6;
+                  for (int i = 1; i <= steps; i++) {
+                      SystemClock.sleep(15);
+                      float iy = y + (yEnd - y) * (i / (float) steps);
+                      injectMotion(MotionEvent.ACTION_MOVE, x, iy, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+                  }
+                  SystemClock.sleep(15);
+                  injectMotion(MotionEvent.ACTION_UP, x, yEnd, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+                  injectMotion(MotionEvent.ACTION_HOVER_MOVE, x, y, InputDevice.SOURCE_MOUSE, 0, 0f, SystemClock.uptimeMillis());
+              }
+
+              private static void runServer() {
+                  ServerSocket bound = null;
+                  int boundPort = -1;
+                  for (int port = 15556; port <= 15565; port++) {
+                      try {
+                          ServerSocket ss = new ServerSocket();
+                          ss.setReuseAddress(true);
+                          ss.bind(new InetSocketAddress(port));
+                          bound = ss;
+                          boundPort = port;
+                          break;
+                      } catch (Throwable ignored) { }
+                  }
+                  if (bound == null) {
+                      System.out.println("TvPointer: no free port in 15556..15565");
+                      System.exit(1);
+                      return;
+                  }
+                  System.out.println("TvPointer: listening on " + boundPort);
+                  try (ServerSocket ss = bound) {
+                      while (true) {
+                          Socket s = ss.accept();
+                          s.setTcpNoDelay(true);
+                          new Thread(() -> handleClient(s)).start();
+                      }
+                  } catch (Throwable t) {
+                      t.printStackTrace();
+                      System.exit(1);
+                  }
+              }
+
+              private static void handleClient(Socket s) {
+                  try (BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()));
+                       OutputStream out = s.getOutputStream()) {
+                      String line;
+                      while ((line = br.readLine()) != null) {
+                          lastActivity = System.currentTimeMillis();
+                          String[] p = line.trim().split(" ");
+                          if (p.length == 0) continue;
+                          switch (p[0]) {
+                              case "PING":
+                                  String pong = "PONG OVL=" + (overlayAttached ? "1" : "0") + "\n";
+                                  out.write(pong.getBytes());
+                                  out.flush();
+                                  break;
+                              case "M":
+                                  if (p.length >= 3) doHover(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
+                                  break;
+                              case "C":
+                                  if (p.length >= 3) doClick(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
+                                  break;
+                              case "L":
+                                  if (p.length >= 3) doLongClick(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
+                                  break;
+                              case "S":
+                                  if (p.length >= 4) doWheelScroll(Float.parseFloat(p[1]), Float.parseFloat(p[2]), Float.parseFloat(p[3]));
+                                  break;
+                              case "H":
+                                  moveOverlay(curX, curY, false);
+                                  break;
+                              case "Q":
+                                  System.exit(0);
+                                  break;
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+              }
+          }
+          PTREOF
+          ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
+          D8_BIN=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -n 1)
+          javac --release 8 -cp "$ANDROID_JAR" -d ptr_src ptr_src/TvPointer.java
+          "$D8_BIN" --min-api 21 --output app/src/main/assets ptr_src/*.class
+          mv app/src/main/assets/classes.dex app/src/main/assets/tvptr.dex
+          ls -lh app/src/main/assets/tvptr.dex
 
       - name: Compilar helper de puntero para la TV
         run: |
