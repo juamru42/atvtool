@@ -1406,6 +1406,8 @@ jobs:
           private const val SERVICE = "com.tvcontrol/com.tvcontrol.PointerService"
 
           private const val SCROLL_GAIN = 3f
+          private const val KEY_STEP = 110f
+          private const val WHEEL_STEP = 45f
 
           /**
            * Conexión abierta con el puntero de la TV. La flecha se dibuja en la TV por este canal;
@@ -1427,6 +1429,10 @@ jobs:
 
               @Volatile
               var alive = true
+
+              /** 0 = deslizamiento táctil, 1 = teclas de página, 2 = rueda (servicio de la TV). */
+              @Volatile
+              var scrollMode = 1
 
               private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
               private val ch = Channel<String>(Channel.UNLIMITED)
@@ -1518,11 +1524,15 @@ jobs:
               }
 
               fun page(up: Boolean) {
-                  val vy = 0.55f * h
-                  scope.launch { swipeBy(0f, if (up) vy else -vy, 350) }
+                  if (scrollMode == 0) {
+                      val vy = 0.55f * h
+                      scope.launch { swipeBy(0f, if (up) vy else -vy, 350) }
+                  } else {
+                      run("input keyevent ${if (up) 92 else 93}")
+                  }
               }
 
-              /** Scroll: junta lo que se desliza y lo manda como deslizamientos desde el puntero. */
+              /** Scroll: junta lo que se desliza y lo manda según el modo (0 táctil, 1 teclas de página, 2 rueda). */
               fun scroll(dx: Float, dy: Float) {
                   synchronized(lock) {
                       accX += dx
@@ -1535,28 +1545,50 @@ jobs:
                           var idle = 0
                           while (true) {
                               delay(90)
+                              val mode = scrollMode
                               var vx = 0f
                               var vy = 0f
                               synchronized(lock) {
                                   vx = accX
                                   vy = accY
                               }
-                              if (abs(vx) + abs(vy) >= 6f) {
-                                  synchronized(lock) {
-                                      accX -= vx
-                                      accY -= vy
+                              if (mode == 0) {
+                                  if (abs(vx) + abs(vy) >= 6f) {
+                                      synchronized(lock) {
+                                          accX -= vx
+                                          accY -= vy
+                                      }
+                                      idle = 0
+                                      swipeBy(vx * SCROLL_GAIN, vy * SCROLL_GAIN, 220)
+                                      continue
                                   }
-                                  idle = 0
-                                  swipeBy(vx * SCROLL_GAIN, vy * SCROLL_GAIN, 220)
                               } else {
-                                  idle++
-                                  if (idle >= 3) {
+                                  val step = if (mode == 1) KEY_STEP else WHEEL_STEP
+                                  if (abs(vy) >= step) {
+                                      val down = vy < 0f
                                       synchronized(lock) {
                                           accX = 0f
-                                          accY = 0f
+                                          accY = (accY + (if (down) step else -step)).coerceIn(-4f * step, 4f * step)
                                       }
-                                      break
+                                      idle = 0
+                                      if (mode == 1) {
+                                          try {
+                                              Adb.shell("input keyevent ${if (down) 93 else 92}")
+                                          } catch (e: Exception) {
+                                          }
+                                      } else {
+                                          ch.trySend("R ${if (down) "down" else "up"}")
+                                      }
+                                      continue
                                   }
+                              }
+                              idle++
+                              if (idle >= 3) {
+                                  synchronized(lock) {
+                                      accX = 0f
+                                      accY = 0f
+                                  }
+                                  break
                               }
                           }
                       } catch (e: Exception) {
@@ -1731,6 +1763,7 @@ jobs:
           import android.graphics.Color
           import android.graphics.Paint
           import android.graphics.Path
+          import android.graphics.Rect
           import android.graphics.PixelFormat
           import android.os.Handler
           import android.os.Looper
@@ -1740,6 +1773,7 @@ jobs:
           import android.view.View
           import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
           import androidx.core.content.pm.PackageInfoCompat
           import java.net.InetSocketAddress
           import java.net.ServerSocket
@@ -1890,6 +1924,7 @@ jobs:
                           }
                       }
                       "F" -> ui.post { cursor?.flash() }
+                      "R" -> ui.post { wheel(p.getOrNull(1) == "down") }
                       "T" -> ui.post {
                           tap(70L)
                           cursor?.flash()
@@ -1970,6 +2005,60 @@ jobs:
                   swipe(0f, if (up) vy else -vy, 350L)
               }
 
+              /** Rueda del mouse: busca el contenido que se puede desplazar bajo el puntero y lo desplaza. */
+              private fun wheel(down: Boolean) {
+                  val root = rootInActiveWindow ?: return
+                  val node = findScrollable(root, cx.toInt(), cy.toInt(), 0) ?: biggestScrollable(root) ?: return
+                  val act = if (down) {
+                      AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN
+                  } else {
+                      AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP
+                  }
+                  if (!node.performAction(act.id)) {
+                      node.performAction(
+                          if (down) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                      )
+                  }
+              }
+
+              private fun findScrollable(n: AccessibilityNodeInfo?, x: Int, y: Int, depth: Int): AccessibilityNodeInfo? {
+                  if (n == null || depth > 50) return null
+                  val r = Rect()
+                  n.getBoundsInScreen(r)
+                  if (!r.contains(x, y)) return null
+                  for (i in n.childCount - 1 downTo 0) {
+                      val f = findScrollable(n.getChild(i), x, y, depth + 1)
+                      if (f != null) return f
+                  }
+                  return if (n.isScrollable) n else null
+              }
+
+              private fun biggestScrollable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  var best: AccessibilityNodeInfo? = null
+                  var bestArea = 0L
+                  val stack = ArrayDeque<AccessibilityNodeInfo>()
+                  stack.add(root)
+                  var count = 0
+                  while (stack.isNotEmpty() && count < 3000) {
+                      val n = stack.removeLast()
+                      count++
+                      if (n.isScrollable) {
+                          val r = Rect()
+                          n.getBoundsInScreen(r)
+                          val area = r.width().toLong() * r.height()
+                          if (area > bestArea) {
+                              bestArea = area
+                              best = n
+                          }
+                      }
+                      for (i in 0 until n.childCount) {
+                          val c = n.getChild(i)
+                          if (c != null) stack.add(c)
+                      }
+                  }
+                  return best
+              }
+
               private fun key(name: String) {
                   when (name) {
                       "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
@@ -2046,7 +2135,7 @@ jobs:
               }
 
               override fun onDraw(c: Canvas) {
-                  val s = 2.2f * sc
+                  val s = 1.5f * sc
                   path.reset()
                   path.moveTo(px, py)
                   path.lineTo(px, py + 20f * s)
@@ -2472,6 +2561,8 @@ jobs:
               var error by remember { mutableStateOf("") }
               var busy by remember { mutableStateOf(false) }
               var speed by remember { mutableFloatStateOf(2.5f) }
+              val prefs = remember { ctx.getSharedPreferences("tv", 0) }
+              var smode by remember { mutableIntStateOf(prefs.getInt("smode", 1)) }
 
               fun start() {
                   if (busy) return
@@ -2490,6 +2581,7 @@ jobs:
               }
 
               LaunchedEffect(Unit) { start() }
+              LaunchedEffect(session, smode) { session?.scrollMode = smode }
               DisposableEffect(Unit) { onDispose { session?.close() } }
               // Si la conexión con el puntero se cae, se avisa y se ofrece reintentar.
               LaunchedEffect(session) {
@@ -2535,6 +2627,15 @@ jobs:
                           value = speed, onValueChange = { speed = it },
                           valueRange = 1f..6f, modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
                       )
+                  }
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Text("Scroll:", fontSize = 12.sp)
+                      listOf(1 to "Teclas", 2 to "Rueda", 0 to "Táctil").forEach { (m, label) ->
+                          Btn3D(
+                              label, { smode = m; prefs.edit().putInt("smode", m).apply() },
+                              color = if (smode == m) TvGreen else TvSlate, small = true
+                          )
+                      }
                   }
                   Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       Btn3D("◀ Atrás", { session?.key("back") }, color = TvSlate, small = true)
@@ -2924,6 +3025,7 @@ jobs:
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagDefault"
               android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
               android:description="@string/pointer_desc"
               android:notificationTimeout="100" />
           TVEOF
