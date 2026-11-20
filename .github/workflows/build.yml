@@ -896,44 +896,22 @@ jobs:
               }
 
               if (!connected) {
-                  Column(
-                      Modifier.fillMaxSize().padding(24.dp).systemBarsPadding(),
-                      verticalArrangement = Arrangement.Center
-                  ) {
-                      Text("📺 TV Control", style = MaterialTheme.typography.headlineMedium)
-                      Spacer(Modifier.height(8.dp))
-                      Text("En la TV activá Depuración USB / por red (Opciones de desarrollador) y escribí su IP.")
-                      Spacer(Modifier.height(16.dp))
-                      OutlinedTextField(host, { host = it }, label = { Text("IP de la TV") },
-                          singleLine = true, modifier = Modifier.fillMaxWidth())
-                      Spacer(Modifier.height(8.dp))
-                      OutlinedTextField(port, { port = it }, label = { Text("Puerto") },
-                          singleLine = true, modifier = Modifier.fillMaxWidth())
-                      Spacer(Modifier.height(16.dp))
-                      Btn3D(
-                          if (busy) "Conectando… (aceptá el aviso en la TV)" else "Conectar",
-                          onClick = {
-                              busy = true; error = ""
-                              scope.launch {
-                                  try {
-                                      Adb.connect(ctx, host.trim(), port.trim().toIntOrNull() ?: 5555)
-                                      prefs.edit().putString("host", host.trim()).putString("port", port.trim()).apply()
-                                      ContextCompat.startForegroundService(
-                                          ctx, Intent(ctx, ConnService::class.java).putExtra("host", host.trim())
-                                      )
-                                  } catch (e: Throwable) {
-                                      error = "No se pudo conectar: ${e.message}"
-                                  }
-                                  busy = false
-                              }
-                          },
-                          Modifier.fillMaxWidth(),
-                          enabled = !busy && host.isNotBlank(),
-                          wide = true
-                      )
-                      if (error.isNotEmpty()) {
-                          Spacer(Modifier.height(8.dp))
-                          Text(error, color = MaterialTheme.colorScheme.error)
+                  ConnectScreen(host, port, busy, error) { h, p ->
+                      host = h
+                      port = p.toString()
+                      busy = true
+                      error = ""
+                      scope.launch {
+                          try {
+                              Adb.connect(ctx, h, p)
+                              prefs.edit().putString("host", h).putString("port", p.toString()).apply()
+                              ContextCompat.startForegroundService(
+                                  ctx, Intent(ctx, ConnService::class.java).putExtra("host", h)
+                              )
+                          } catch (e: Throwable) {
+                              error = "No se pudo conectar: ${e.message}"
+                          }
+                          busy = false
                       }
                   }
                   return
@@ -1155,6 +1133,17 @@ jobs:
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.gestures.detectDragGestures
+          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.gestures.detectVerticalDragGestures
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.unit.sp
+          import kotlin.math.abs
 
           private const val REC_PATH = "/sdcard/tvrec.mp4"
 
@@ -1169,6 +1158,7 @@ jobs:
               var recording by remember { mutableStateOf(false) }
               var busy by remember { mutableStateOf(false) }
               var small by remember { mutableStateOf(true) }
+              var mouseMode by remember { mutableStateOf(false) }
 
               LaunchedEffect(Unit) {
                   recording = try { Adb.shell("pidof screenrecord").trim().isNotEmpty() } catch (e: Throwable) { false }
@@ -1237,10 +1227,19 @@ jobs:
                   horizontalAlignment = Alignment.CenterHorizontally,
                   verticalArrangement = Arrangement.spacedBy(6.dp)
               ) {
-                  // D-pad
-                  K("▲", 19)
-                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) { K("◀", 21); K("OK", 23, TvGreen); K("▶", 22) }
-                  K("▼", 20)
+                  // Selector de modo
+                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                      Btn3D("🎮 Botones", { mouseMode = false }, color = if (!mouseMode) TvBlue else TvSlate, small = true)
+                      Btn3D("🖱 Ratón", { mouseMode = true }, color = if (mouseMode) TvBlue else TvSlate, small = true)
+                  }
+                  if (mouseMode) {
+                      MousePad { msg = it }
+                  } else {
+                      // D-pad
+                      K("▲", 19)
+                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) { K("◀", 21); K("OK", 23, TvGreen); K("▶", 22) }
+                      K("▼", 20)
+                  }
                   Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                       K("Atrás", 4, TvSlate); K("Inicio", 3, TvSlate); K("Menú", 82, TvSlate)
                   }
@@ -1319,6 +1318,159 @@ jobs:
                       },
                       dismissButton = { TextButton(onClick = { confirmReboot = false }) { Text("Cancelar") } }
                   )
+              }
+          }
+
+          /**
+           * Panel de ratón. El panel representa la pantalla de la TV (con su misma proporción):
+           *  - arrastrar con un dedo mueve el puntero (el punto verde);
+           *  - un toque = clic en la posición del puntero; mantener = clic largo;
+           *  - la franja de la derecha hace scroll al deslizar el dedo hacia arriba o abajo.
+           * Todo se manda por ADB (input tap / input swipe), así que el puntero es virtual:
+           * solo se manda algo a la TV cuando se hace clic o scroll.
+           */
+          @Composable
+          fun MousePad(onMsg: (String) -> Unit) {
+              val scope = rememberCoroutineScope()
+              var tvW by remember { mutableIntStateOf(1920) }
+              var tvH by remember { mutableIntStateOf(1080) }
+              var cx by remember { mutableFloatStateOf(0.5f) }
+              var cy by remember { mutableFloatStateOf(0.5f) }
+              var speed by remember { mutableFloatStateOf(1.8f) }
+              var useMouse by remember { mutableStateOf(false) }
+              var invert by remember { mutableStateOf(false) }
+              var acc by remember { mutableFloatStateOf(0f) }
+
+              // Resolución real de la TV (la última cifra NxM es la que se usa si hay "Override size")
+              LaunchedEffect(Unit) {
+                  try {
+                      val m = Regex("""(\d+)x(\d+)""").findAll(Adb.shell("wm size")).lastOrNull()
+                      if (m != null) {
+                          tvW = m.groupValues[1].toInt()
+                          tvH = m.groupValues[2].toInt()
+                      }
+                  } catch (e: Throwable) { }
+              }
+
+              fun px() = (cx * tvW).toInt().coerceIn(0, tvW - 1)
+              fun py() = (cy * tvH).toInt().coerceIn(0, tvH - 1)
+              fun src() = if (useMouse) "mouse " else ""
+
+              fun send(cmd: String) {
+                  scope.launch {
+                      try { Adb.shell(cmd) } catch (e: Throwable) { onMsg("Error: ${e.message}") }
+                  }
+              }
+
+              fun tap() = send("input ${src()}tap ${px()} ${py()}")
+              fun doubleTap() {
+                  val c = "input ${src()}tap ${px()} ${py()}"
+                  send("$c; $c")
+              }
+              fun longTap() = send("input ${src()}swipe ${px()} ${py()} ${px()} ${py()} 700")
+
+              // dir = +1: el dedo baja (se ve lo de arriba); dir = -1: el dedo sube (se ve lo de abajo)
+              fun scrollStep(dir: Int) {
+                  val d = (tvH * 0.22f).toInt()
+                  val x = px()
+                  val y0 = (py() - dir * d / 2).coerceIn(10, tvH - 10)
+                  val y1 = (y0 + dir * d).coerceIn(10, tvH - 10)
+                  send("input swipe $x $y0 $x $y1 120")
+              }
+
+              Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                  BoxWithConstraints(Modifier.fillMaxWidth()) {
+                      val stripW = 56.dp
+                      val padW = maxWidth - stripW - 8.dp
+                      val padH = padW * (tvH.toFloat() / tvW.toFloat())
+                      val shape = RoundedCornerShape(16.dp)
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          // Panel del puntero
+                          Box(
+                              Modifier
+                                  .width(padW)
+                                  .height(padH)
+                                  .clip(shape)
+                                  .background(TvSurface)
+                                  .border(1.dp, Color.White.copy(alpha = 0.15f), shape)
+                                  .pointerInput(Unit) {
+                                      detectTapGestures(onTap = { tap() }, onLongPress = { longTap() })
+                                  }
+                                  .pointerInput(Unit) {
+                                      detectDragGestures { change, d ->
+                                          change.consume()
+                                          cx = (cx + d.x * speed / size.width).coerceIn(0f, 1f)
+                                          cy = (cy + d.y * speed / size.height).coerceIn(0f, 1f)
+                                      }
+                                  }
+                          ) {
+                              Text(
+                                  "Arrastrá para mover · tocá para hacer clic",
+                                  Modifier.align(Alignment.Center),
+                                  fontSize = 11.sp,
+                                  color = Color.White.copy(alpha = 0.35f)
+                              )
+                              Box(
+                                  Modifier
+                                      .offset(x = padW * cx - 8.dp, y = padH * cy - 8.dp)
+                                      .size(16.dp)
+                                      .background(TvGreen, CircleShape)
+                                      .border(2.dp, Color.White, CircleShape)
+                              )
+                          }
+                          // Franja de scroll
+                          Box(
+                              Modifier
+                                  .width(stripW)
+                                  .height(padH)
+                                  .clip(shape)
+                                  .background(TvSurface)
+                                  .border(1.dp, Color.White.copy(alpha = 0.15f), shape)
+                                  .pointerInput(Unit) {
+                                      val step = 48.dp.toPx()
+                                      detectVerticalDragGestures(
+                                          onDragStart = { acc = 0f },
+                                          onVerticalDrag = { change, dy ->
+                                              change.consume()
+                                              acc += dy
+                                              while (abs(acc) >= step) {
+                                                  val dir = if (acc > 0f) 1 else -1
+                                                  acc -= dir * step
+                                                  scrollStep(if (invert) -dir else dir)
+                                              }
+                                          }
+                                      )
+                                  },
+                              contentAlignment = Alignment.Center
+                          ) {
+                              Text("⇅", fontSize = 22.sp, color = Color.White.copy(alpha = 0.6f))
+                          }
+                      }
+                  }
+
+                  Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                      Btn3D("Clic", { tap() }, color = TvGreen, small = true)
+                      Btn3D("Doble", { doubleTap() }, color = TvBlue, small = true)
+                      Btn3D("Largo", { longTap() }, color = TvAmber, small = true)
+                      Btn3D("Centrar", { cx = 0.5f; cy = 0.5f }, color = TvSlate, small = true)
+                  }
+                  Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                      Btn3D("▲ Scroll", { scrollStep(1) }, color = TvPurple, small = true)
+                      Btn3D("▼ Scroll", { scrollStep(-1) }, color = TvPurple, small = true)
+                      Btn3D("Pág ▲", { send("input keyevent 92") }, color = TvSlate, small = true)
+                      Btn3D("Pág ▼", { send("input keyevent 93") }, color = TvSlate, small = true)
+                  }
+
+                  Text("Velocidad del puntero", style = MaterialTheme.typography.bodySmall)
+                  Slider(speed, { speed = it }, modifier = Modifier.fillMaxWidth(), valueRange = 0.8f..4f)
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Checkbox(useMouse, { useMouse = it })
+                      Text("Enviar clics como ratón (en vez de toque)", style = MaterialTheme.typography.bodySmall)
+                  }
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Checkbox(invert, { invert = it })
+                      Text("Invertir dirección del scroll", style = MaterialTheme.typography.bodySmall)
+                  }
               }
           }
           TVEOF
@@ -1462,6 +1614,260 @@ jobs:
                       .padding(12.dp),
                   content = content
               )
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/Connect.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import androidx.compose.animation.core.LinearEasing
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.sync.Semaphore
+          import kotlinx.coroutines.sync.withPermit
+          import java.net.Inet4Address
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.net.NetworkInterface
+          import java.net.Socket
+          import java.util.concurrent.atomic.AtomicInteger
+
+          data class Found(val ip: String, val port: Int, val name: String? = null)
+
+          /** Prefijo de la red local (ej. "192.168.1"), o null si no hay wifi/LAN. */
+          private fun localBase(): String? = try {
+              NetworkInterface.getNetworkInterfaces().toList()
+                  .filter { it.isUp && !it.isLoopback }
+                  .sortedByDescending { it.name.startsWith("wlan") }
+                  .flatMap { it.inetAddresses.toList() }
+                  .filterIsInstance<Inet4Address>()
+                  .firstOrNull { it.isSiteLocalAddress }
+                  ?.hostAddress?.substringBeforeLast('.')
+          } catch (e: Exception) { null }
+
+          private fun portOpen(ip: String, port: Int, timeoutMs: Int = 700): Boolean = try {
+              Socket().use { it.connect(InetSocketAddress(ip, port), timeoutMs); true }
+          } catch (e: Exception) { false }
+
+          @Composable
+          private fun Radar(modifier: Modifier = Modifier) {
+              val t = rememberInfiniteTransition(label = "radar")
+              val p by t.animateFloat(
+                  initialValue = 0f, targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(2400, easing = LinearEasing)),
+                  label = "p"
+              )
+              Canvas(modifier) {
+                  val maxR = size.minDimension / 2
+                  for (k in 0..2) {
+                      val q = (p + k / 3f) % 1f
+                      drawCircle(TvBlue.copy(alpha = (1f - q) * 0.5f), radius = maxR * q, center = center, style = Stroke(width = 3f))
+                  }
+                  drawCircle(TvBlue, radius = 10f, center = center)
+              }
+          }
+
+          @Composable
+          private fun DeviceCard(f: Found, enabled: Boolean, onClick: () -> Unit) {
+              val shape = RoundedCornerShape(14.dp)
+              Row(
+                  Modifier.fillMaxWidth().padding(top = 8.dp)
+                      .background(Color.White.copy(alpha = 0.06f), shape)
+                      .border(1.dp, Color.White.copy(alpha = 0.12f), shape)
+                      .padding(12.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Box(
+                      Modifier.size(44.dp).background(TvBlue.copy(alpha = 0.25f), RoundedCornerShape(12.dp)),
+                      contentAlignment = Alignment.Center
+                  ) { Text("📺", fontSize = 22.sp) }
+                  Spacer(Modifier.width(12.dp))
+                  Column(Modifier.weight(1f)) {
+                      Text(f.name ?: "Dispositivo Android", fontWeight = FontWeight.SemiBold, maxLines = 1)
+                      Text(
+                          "${f.ip}:${f.port}",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
+                      )
+                  }
+                  Btn3D("Conectar", onClick, color = TvGreen, enabled = enabled, small = true)
+              }
+          }
+
+          /**
+           * Pantalla inicial: busca sola en la red wifi los equipos con ADB por red activado
+           * (puerto 5555) y los muestra como tarjetas. También se puede conectar escribiendo la IP.
+           */
+          @Composable
+          fun ConnectScreen(
+              savedHost: String,
+              savedPort: String,
+              busy: Boolean,
+              error: String,
+              onConnect: (String, Int) -> Unit
+          ) {
+              var host by remember { mutableStateOf(savedHost) }
+              var port by remember { mutableStateOf(savedPort) }
+              val found = remember { mutableStateListOf<Found>() }
+              var scanning by remember { mutableStateOf(true) }
+              var progress by remember { mutableIntStateOf(0) }
+              var round by remember { mutableIntStateOf(0) }
+              var subnet by remember { mutableStateOf("") }
+              var noNet by remember { mutableStateOf(false) }
+
+              LaunchedEffect(round) {
+                  found.clear(); progress = 0; scanning = true; noNet = false
+                  val base = withContext(Dispatchers.IO) { localBase() }
+                  if (base == null) { noNet = true; scanning = false; return@LaunchedEffect }
+                  subnet = base
+                  val ports = listOf(5555, port.toIntOrNull() ?: 5555).distinct()
+                  val sem = Semaphore(48)
+                  val done = AtomicInteger(0)
+                  coroutineScope {
+                      (1..254).map { i ->
+                          launch(Dispatchers.IO) {
+                              val ip = "$base.$i"
+                              sem.withPermit {
+                                  for (p in ports) {
+                                      if (portOpen(ip, p)) {
+                                          withContext(Dispatchers.Main) { found.add(Found(ip, p)) }
+                                          break
+                                      }
+                                  }
+                              }
+                              val d = done.incrementAndGet()
+                              withContext(Dispatchers.Main) { progress = d }
+                          }
+                      }.joinAll()
+                  }
+                  scanning = false
+                  found.sortBy { it.ip.substringAfterLast('.').toIntOrNull() ?: 0 }
+
+                  // Nombres de host (si el router los publica); no bloquea la lista
+                  val snap = found.toList()
+                  val names = withContext(Dispatchers.IO) {
+                      snap.map { f ->
+                          async { runCatching { InetAddress.getByName(f.ip).canonicalHostName }.getOrNull() }
+                      }.awaitAll()
+                  }
+                  snap.forEachIndexed { i, f ->
+                      val n = names[i]
+                      if (n != null && n != f.ip) {
+                          val k = found.indexOfFirst { it.ip == f.ip && it.port == f.port }
+                          if (k >= 0) found[k] = f.copy(name = n)
+                      }
+                  }
+              }
+
+              val bg = Brush.verticalGradient(listOf(Color(0xFF16305F), TvBg, Color(0xFF060A14)))
+              val muted = Color(0xFF94A3B8)
+
+              Column(
+                  Modifier.fillMaxSize().background(bg).systemBarsPadding()
+                      .verticalScroll(rememberScrollState()).padding(20.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Spacer(Modifier.height(8.dp))
+                  Box(
+                      Modifier.size(88.dp)
+                          .background(Brush.linearGradient(listOf(TvBlue, TvPurple)), CircleShape)
+                          .border(2.dp, Color.White.copy(alpha = 0.35f), CircleShape),
+                      contentAlignment = Alignment.Center
+                  ) { Text("📺", fontSize = 40.sp) }
+                  Spacer(Modifier.height(12.dp))
+                  Text("TV Control", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                  Text(
+                      "Controlá tu TV o box Android desde el teléfono",
+                      fontSize = 14.sp, color = muted, textAlign = TextAlign.Center
+                  )
+                  Spacer(Modifier.height(20.dp))
+
+                  Panel {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text("📡 Dispositivos en tu red", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                          if (scanning) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                      }
+                      Text(
+                          when {
+                              noNet -> "Sin red wifi"
+                              scanning -> "Buscando en $subnet.x…  $progress/254"
+                              found.isEmpty() -> "Búsqueda terminada"
+                              else -> "${found.size} encontrado(s)"
+                          },
+                          style = MaterialTheme.typography.bodySmall, color = muted
+                      )
+                      if (scanning && found.isEmpty()) {
+                          Radar(Modifier.fillMaxWidth().height(140.dp))
+                      }
+                      found.forEach { f -> DeviceCard(f, !busy) { onConnect(f.ip, f.port) } }
+                      if (!scanning && found.isEmpty()) {
+                          Spacer(Modifier.height(8.dp))
+                          Text(
+                              if (noNet) "Conectate al mismo wifi que la TV y buscá de nuevo."
+                              else "No apareció ningún equipo. Activá la depuración por red en la TV " +
+                                  "(Opciones de desarrollador) y buscá de nuevo, o escribí la IP abajo.",
+                              style = MaterialTheme.typography.bodySmall, color = muted
+                          )
+                      }
+                      Spacer(Modifier.height(10.dp))
+                      Btn3D("🔄 Buscar de nuevo", { round++ }, color = TvSlate, enabled = !scanning && !busy, small = true)
+                  }
+
+                  Spacer(Modifier.height(14.dp))
+
+                  Panel {
+                      Text("✍ Conectar por IP", style = MaterialTheme.typography.titleSmall)
+                      Spacer(Modifier.height(8.dp))
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          OutlinedTextField(host, { host = it }, label = { Text("IP de la TV") },
+                              singleLine = true, modifier = Modifier.weight(2f))
+                          OutlinedTextField(port, { port = it }, label = { Text("Puerto") },
+                              singleLine = true, modifier = Modifier.weight(1f))
+                      }
+                      Spacer(Modifier.height(10.dp))
+                      Btn3D(
+                          "Conectar",
+                          { onConnect(host.trim(), port.trim().toIntOrNull() ?: 5555) },
+                          Modifier.fillMaxWidth(),
+                          enabled = !busy && host.isNotBlank(),
+                          wide = true
+                      )
+                  }
+
+                  if (busy) {
+                      Spacer(Modifier.height(14.dp))
+                      LinearProgressIndicator(Modifier.fillMaxWidth())
+                      Spacer(Modifier.height(6.dp))
+                      Text("Conectando… aceptá el aviso en la TV", style = MaterialTheme.typography.bodySmall, color = muted)
+                  }
+                  if (error.isNotEmpty()) {
+                      Spacer(Modifier.height(10.dp))
+                      Text(error, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
+                  }
+                  Spacer(Modifier.height(16.dp))
+              }
           }
           TVEOF
           mkdir -p app/src/main/res/drawable
