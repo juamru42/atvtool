@@ -35,7 +35,7 @@ jobs:
                   targetSdk = 34
                   // sube sola en cada compilación de GitHub, así se puede actualizar sin desinstalar
                   versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
-                  versionName = "1.1"
+                  versionName = "1.2"
               }
 
               signingConfigs {
@@ -1091,9 +1091,8 @@ jobs:
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.gestures.detectDragGestures
-          import androidx.compose.foundation.gestures.detectTapGestures
-          import androidx.compose.foundation.gestures.detectVerticalDragGestures
+          import androidx.compose.foundation.gestures.awaitEachGesture
+          import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.CircleShape
@@ -1120,6 +1119,7 @@ jobs:
           import java.util.Date
           import java.util.Locale
           import kotlin.math.abs
+          import kotlin.math.hypot
           import kotlin.math.roundToInt
 
           private const val REC_PATH = "/sdcard/tvrec.mp4"
@@ -1200,7 +1200,7 @@ jobs:
                   Btn3D(label, { key(code) }, Modifier.width(w), color = color, wide = true)
 
               Column(
-                  Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
+                  Modifier.fillMaxSize().verticalScroll(rememberScrollState(), enabled = !mouseMode).padding(12.dp),
                   horizontalAlignment = Alignment.CenterHorizontally,
                   verticalArrangement = Arrangement.spacedBy(6.dp)
               ) {
@@ -1309,11 +1309,10 @@ jobs:
               var speed by remember { mutableFloatStateOf(1.6f) }
               var invert by remember { mutableStateOf(false) }
               var acc by remember { mutableFloatStateOf(0f) }
-              var supportsMotionEvent by remember { mutableStateOf(true) }
               var moveJob by remember { mutableStateOf<Job?>(null) }
               var pendingX by remember { mutableIntStateOf(960) }
               var pendingY by remember { mutableIntStateOf(540) }
-              var isPointerDown by remember { mutableStateOf(false) }
+              var hoverCmd by remember { mutableStateOf("mouse") }
 
               LaunchedEffect(Unit) {
                   try {
@@ -1325,9 +1324,15 @@ jobs:
                           pendingX = tvW / 2
                           pendingY = tvH / 2
                       }
-                      val help = Adb.shell("input motionevent 2>&1")
-                      if (help.contains("Unknown") || help.contains("Error") || help.contains("not found")) {
-                          supportsMotionEvent = false
+                      // Activar puntero de mouse en el sistema (muestra el cursor blanco/negro de Android en FlowBox/TV)
+                      Adb.shell("settings put system pointer_location 0; wm dismiss-keyguard 2>/dev/null")
+                      val res = Adb.shell("input mouse move ${tvW / 2} ${tvH / 2} 2>&1")
+                      hoverCmd = when {
+                          !res.contains("Unknown") && !res.contains("Error") -> "mouse"
+                          else -> {
+                              val res2 = Adb.shell("input motionevent HOVER_MOVE ${tvW / 2} ${tvH / 2} 2>&1")
+                              if (!res2.contains("Unknown") && !res2.contains("Error")) "motionevent" else "none"
+                          }
                       }
                   } catch (_: Throwable) { }
               }
@@ -1344,47 +1349,28 @@ jobs:
               fun scheduleMove(x: Int, y: Int) {
                   pendingX = x
                   pendingY = y
-                  if (!supportsMotionEvent) return
+                  if (hoverCmd == "none") return
                   if (moveJob?.isActive == true) return
                   moveJob = scope.launch {
-                      delay(45)
+                      delay(35)
                       val tx = pendingX
                       val ty = pendingY
                       try {
-                          val action = if (isPointerDown) "MOVE" else "HOVER_MOVE"
-                          val res = Adb.shell("input motionevent $action $tx $ty 2>&1")
-                          if (res.contains("Unknown") || res.contains("Error")) {
-                              supportsMotionEvent = false
+                          val cmd = if (hoverCmd == "mouse") {
+                              "input mouse move $tx $ty"
+                          } else {
+                              "input motionevent HOVER_MOVE $tx $ty"
                           }
-                      } catch (e: Throwable) {
-                          onMsg("Error: ${e.message}")
-                      }
+                          Adb.shell(cmd)
+                      } catch (_: Throwable) { }
                   }
-              }
-
-              fun onTouchDown() {
-                  isPointerDown = true
-                  if (supportsMotionEvent) {
-                      send("input motionevent DOWN ${px()} ${py()}")
-                  }
-              }
-
-              fun onTouchUp() {
-                  val x = px()
-                  val y = py()
-                  if (supportsMotionEvent) {
-                      send("input motionevent UP $x $y")
-                  } else {
-                      send("input tap $x $y")
-                  }
-                  isPointerDown = false
               }
 
               fun tap() {
                   val x = px()
                   val y = py()
-                  if (supportsMotionEvent) {
-                      send("input motionevent DOWN $x $y; input motionevent UP $x $y")
+                  if (hoverCmd == "mouse") {
+                      send("input mouse move $x $y; input mouse tap $x $y")
                   } else {
                       send("input tap $x $y")
                   }
@@ -1395,11 +1381,11 @@ jobs:
               }
 
               fun scrollStep(dir: Int) {
-                  val d = (tvH * 0.24f).toInt()
+                  val d = (tvH * 0.25f).toInt()
                   val x = px()
-                  val y0 = (py() - dir * d / 2).coerceIn(10, tvH - 10)
-                  val y1 = (y0 + dir * d).coerceIn(10, tvH - 10)
-                  send("input swipe $x $y0 $x $y1 120")
+                  val y0 = (py() - dir * d / 2).coerceIn(20, tvH - 20)
+                  val y1 = (y0 + dir * d).coerceIn(20, tvH - 20)
+                  send("input swipe $x $y0 $x $y1 150")
               }
 
               @Composable
@@ -1429,12 +1415,13 @@ jobs:
                   }
 
                   BoxWithConstraints(Modifier.fillMaxWidth()) {
-                      val stripW = 46.dp
+                      val stripW = 48.dp
                       val padW = maxWidth - stripW - 8.dp
                       val padH = 310.dp
                       val shape = RoundedCornerShape(16.dp)
 
                       Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          // Touchpad: un solo detector de gestos que diferencia toque corto (tap) de arrastre (move)
                           Box(
                               Modifier
                                   .width(padW)
@@ -1442,30 +1429,42 @@ jobs:
                                   .clip(shape)
                                   .background(Color(0xFF3A3D4A))
                                   .border(1.dp, Color.White.copy(alpha = 0.12f), shape)
-                                  .pointerInput(Unit) {
-                                      detectTapGestures(
-                                          onPress = {
-                                              onTouchDown()
-                                              tryAwaitRelease()
-                                              onTouchUp()
-                                          },
-                                          onTap = { tap() },
-                                          onLongPress = {
-                                              val x = px(); val y = py()
-                                              send("input swipe $x $y $x $y 700")
+                                  .pointerInput(speed) {
+                                      awaitEachGesture {
+                                          val down = awaitFirstDown(requireUnconsumed = false)
+                                          down.consume()
+                                          var totalDist = 0f
+                                          var lastPos = down.position
+                                          val downTime = System.currentTimeMillis()
+                                          var longTriggered = false
+
+                                          while (true) {
+                                              val event = awaitPointerEvent()
+                                              val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                              if (!change.pressed) {
+                                                  change.consume()
+                                                  break
+                                              }
+                                              val delta = change.position - lastPos
+                                              lastPos = change.position
+                                              totalDist += hypot(delta.x, delta.y)
+                                              change.consume()
+
+                                              if (delta.x != 0f || delta.y != 0f) {
+                                                  cx = (cx + delta.x * speed / size.width).coerceIn(0f, 1f)
+                                                  cy = (cy + delta.y * speed / size.height).coerceIn(0f, 1f)
+                                                  scheduleMove(px(), py())
+                                              }
+                                              if (!longTriggered && totalDist < 12f && System.currentTimeMillis() - downTime > 650) {
+                                                  longTriggered = true
+                                                  val x = px(); val y = py()
+                                                  send("input swipe $x $y $x $y 700")
+                                              }
                                           }
-                                      )
-                                  }
-                                  .pointerInput(Unit) {
-                                      detectDragGestures(
-                                          onDragStart = { isPointerDown = true },
-                                          onDragEnd = { isPointerDown = false },
-                                          onDragCancel = { isPointerDown = false }
-                                      ) { change, d ->
-                                          change.consume()
-                                          cx = (cx + d.x * speed / size.width).coerceIn(0f, 1f)
-                                          cy = (cy + d.y * speed / size.height).coerceIn(0f, 1f)
-                                          scheduleMove(px(), py())
+
+                                          if (!longTriggered && totalDist < 12f) {
+                                              tap()
+                                          }
                                       }
                                   }
                           ) {
@@ -1490,15 +1489,16 @@ jobs:
                               Box(
                                   Modifier
                                       .offset(
-                                          x = (padW - 16.dp) * cx,
-                                          y = (padH - 16.dp) * cy
+                                          x = (padW - 18.dp) * cx,
+                                          y = (padH - 18.dp) * cy
                                       )
-                                      .size(16.dp)
+                                      .size(18.dp)
                                       .background(TvGreen, CircleShape)
                                       .border(2.dp, Color.White, CircleShape)
                               )
                           }
 
+                          // Franja de scroll independiente (solo hace scroll, nunca clic al tocar)
                           Column(
                               Modifier
                                   .width(stripW)
@@ -1510,19 +1510,30 @@ jobs:
                               verticalArrangement = Arrangement.SpaceBetween
                           ) {
                               Box(
-                                  Modifier.fillMaxWidth().height(42.dp).clickable { scrollStep(1) },
+                                  Modifier.fillMaxWidth().height(44.dp).clickable { scrollStep(1) },
                                   contentAlignment = Alignment.Center
-                              ) { Text("⌃", fontSize = 18.sp, color = Color.White.copy(alpha = 0.7f)) }
+                              ) { Text("⌃", fontSize = 18.sp, color = Color.White.copy(alpha = 0.8f)) }
 
                               Box(
                                   Modifier
                                       .fillMaxWidth()
                                       .weight(1f)
-                                      .pointerInput(Unit) {
-                                          val step = 44.dp.toPx()
-                                          detectVerticalDragGestures(
-                                              onDragStart = { acc = 0f },
-                                              onVerticalDrag = { change, dy ->
+                                      .pointerInput(invert) {
+                                          val step = 36.dp.toPx()
+                                          awaitEachGesture {
+                                              val down = awaitFirstDown(requireUnconsumed = false)
+                                              down.consume()
+                                              acc = 0f
+                                              var lastY = down.position.y
+                                              while (true) {
+                                                  val event = awaitPointerEvent()
+                                                  val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                  if (!change.pressed) {
+                                                      change.consume()
+                                                      break
+                                                  }
+                                                  val dy = change.position.y - lastY
+                                                  lastY = change.position.y
                                                   change.consume()
                                                   acc += dy
                                                   while (abs(acc) >= step) {
@@ -1531,22 +1542,22 @@ jobs:
                                                       scrollStep(if (invert) -dir else dir)
                                                   }
                                               }
-                                          )
+                                          }
                                       },
                                   contentAlignment = Alignment.Center
                               ) {
                                   Box(
                                       Modifier
-                                          .width(3.dp)
+                                          .width(4.dp)
                                           .fillMaxHeight(0.75f)
-                                          .background(Color.White.copy(alpha = 0.2f), CircleShape)
+                                          .background(Color.White.copy(alpha = 0.25f), CircleShape)
                                   )
                               }
 
                               Box(
-                                  Modifier.fillMaxWidth().height(42.dp).clickable { scrollStep(-1) },
+                                  Modifier.fillMaxWidth().height(44.dp).clickable { scrollStep(-1) },
                                   contentAlignment = Alignment.Center
-                              ) { Text("⌄", fontSize = 18.sp, color = Color.White.copy(alpha = 0.7f)) }
+                              ) { Text("⌄", fontSize = 18.sp, color = Color.White.copy(alpha = 0.8f)) }
                           }
                       }
                   }
