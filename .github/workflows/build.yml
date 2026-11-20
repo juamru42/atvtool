@@ -140,7 +140,8 @@ jobs:
               private var dadb: Dadb? = null
               private var appCtx: Context? = null
               @Volatile
-              private var host: String = ""
+              var host: String = ""
+                  private set
               private var port: Int = 5555
               private val reconnectLock = Mutex()
 
@@ -1301,6 +1302,7 @@ jobs:
               onMsg: (String) -> Unit,
               onNavKey: (Int) -> Unit
           ) {
+              val ctx = LocalContext.current
               val scope = rememberCoroutineScope()
               var tvW by remember { mutableIntStateOf(1920) }
               var tvH by remember { mutableIntStateOf(1080) }
@@ -1309,10 +1311,43 @@ jobs:
               var speed by remember { mutableFloatStateOf(1.6f) }
               var invert by remember { mutableStateOf(false) }
               var acc by remember { mutableFloatStateOf(0f) }
-              var moveJob by remember { mutableStateOf<Job?>(null) }
-              var pendingX by remember { mutableIntStateOf(960) }
-              var pendingY by remember { mutableIntStateOf(540) }
-              var hoverCmd by remember { mutableStateOf("mouse") }
+              var pointerReady by remember { mutableStateOf(false) }
+              var ptrOut by remember { mutableStateOf<java.io.PrintWriter?>(null) }
+              var ptrSock by remember { mutableStateOf<java.net.Socket?>(null) }
+              var lastMoveSent by remember { mutableLongStateOf(0L) }
+              var scrollJob by remember { mutableStateOf<Job?>(null) }
+
+              fun closePtrSocket() {
+                  runCatching { ptrOut?.println("H"); ptrOut?.flush() }
+                  runCatching { ptrOut?.close() }
+                  runCatching { ptrSock?.close() }
+                  ptrOut = null
+                  ptrSock = null
+                  pointerReady = false
+              }
+
+              suspend fun tryConnectPtr(host: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                  try {
+                      val s = java.net.Socket()
+                      s.tcpNoDelay = true
+                      s.connect(java.net.InetSocketAddress(host, 15556), 600)
+                      val pw = java.io.PrintWriter(java.io.BufferedWriter(java.io.OutputStreamWriter(s.getOutputStream())), true)
+                      pw.println("PING")
+                      s.soTimeout = 600
+                      val resp = java.io.BufferedReader(java.io.InputStreamReader(s.getInputStream())).readLine()
+                      if (resp == "PONG") {
+                          s.soTimeout = 0
+                          ptrSock = s
+                          ptrOut = pw
+                          true
+                      } else {
+                          s.close()
+                          false
+                      }
+                  } catch (_: Throwable) {
+                      false
+                  }
+              }
 
               LaunchedEffect(Unit) {
                   try {
@@ -1321,71 +1356,107 @@ jobs:
                       if (m != null) {
                           tvW = m.groupValues[1].toInt()
                           tvH = m.groupValues[2].toInt()
-                          pendingX = tvW / 2
-                          pendingY = tvH / 2
                       }
-                      // Activar puntero de mouse en el sistema (muestra el cursor blanco/negro de Android en FlowBox/TV)
-                      Adb.shell("settings put system pointer_location 0; wm dismiss-keyguard 2>/dev/null")
-                      val res = Adb.shell("input mouse move ${tvW / 2} ${tvH / 2} 2>&1")
-                      hoverCmd = when {
-                          !res.contains("Unknown") && !res.contains("Error") -> "mouse"
-                          else -> {
-                              val res2 = Adb.shell("input motionevent HOVER_MOVE ${tvW / 2} ${tvH / 2} 2>&1")
-                              if (!res2.contains("Unknown") && !res2.contains("Error")) "motionevent" else "none"
+                      val h = Adb.host
+                      if (h.isNotEmpty()) {
+                          if (!tryConnectPtr(h)) {
+                              val dexLocal = java.io.File(ctx.cacheDir, "tvptr.dex")
+                              ctx.assets.open("tvptr.dex").use { inp ->
+                                  dexLocal.outputStream().use { outStr -> inp.copyTo(outStr) }
+                              }
+                              Adb.push(dexLocal, "/data/local/tmp/tvptr.dex")
+                              kotlinx.coroutines.withTimeoutOrNull(3000) {
+                                  Adb.shell("nohup env CLASSPATH=/data/local/tmp/tvptr.dex app_process / TvPointer >/dev/null 2>&1 </dev/null &")
+                              }
+                              repeat(8) {
+                                  if (!pointerReady) {
+                                      delay(250)
+                                      if (tryConnectPtr(h)) pointerReady = true
+                                  }
+                              }
+                          } else {
+                              pointerReady = true
+                          }
+                      }
+                      if (pointerReady) {
+                          kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                              ptrOut?.println("M ${tvW / 2} ${tvH / 2}")
                           }
                       }
                   } catch (_: Throwable) { }
               }
 
-              fun px() = (cx * tvW).roundToInt().coerceIn(0, tvW - 1)
-              fun py() = (cy * tvH).roundToInt().coerceIn(0, tvH - 1)
-
-              fun send(cmd: String) {
-                  scope.launch {
-                      try { Adb.shell(cmd) } catch (e: Throwable) { onMsg("Error: ${e.message}") }
+              DisposableEffect(Unit) {
+                  onDispose {
+                      scope.launch(kotlinx.coroutines.Dispatchers.IO) { closePtrSocket() }
                   }
               }
 
-              fun scheduleMove(x: Int, y: Int) {
-                  pendingX = x
-                  pendingY = y
-                  if (hoverCmd == "none") return
-                  if (moveJob?.isActive == true) return
-                  moveJob = scope.launch {
-                      delay(35)
-                      val tx = pendingX
-                      val ty = pendingY
-                      try {
-                          val cmd = if (hoverCmd == "mouse") {
-                              "input mouse move $tx $ty"
-                          } else {
-                              "input motionevent HOVER_MOVE $tx $ty"
-                          }
-                          Adb.shell(cmd)
-                      } catch (_: Throwable) { }
+              fun px() = (cx * tvW).roundToInt().coerceIn(0, tvW - 1)
+              fun py() = (cy * tvH).roundToInt().coerceIn(0, tvH - 1)
+
+              fun sendPtr(line: String, fallbackCmd: String? = null) {
+                  scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                      val pw = ptrOut
+                      if (pointerReady && pw != null) {
+                          try {
+                              pw.println(line)
+                              if (!pw.checkError()) return@launch
+                          } catch (_: Throwable) { }
+                          pointerReady = false
+                      }
+                      if (fallbackCmd != null) {
+                          try { Adb.shell(fallbackCmd) } catch (e: Throwable) { onMsg("Error: ${e.message}") }
+                      }
                   }
+              }
+
+              fun moveCursor(x: Int, y: Int) {
+                  val now = System.currentTimeMillis()
+                  if (now - lastMoveSent < 16L) return
+                  lastMoveSent = now
+                  sendPtr("M $x $y")
               }
 
               fun tap() {
                   val x = px()
                   val y = py()
-                  if (hoverCmd == "mouse") {
-                      send("input mouse move $x $y; input mouse tap $x $y")
-                  } else {
-                      send("input tap $x $y")
-                  }
+                  sendPtr("C $x $y", "input tap $x $y")
+              }
+
+              fun longTap() {
+                  val x = px()
+                  val y = py()
+                  sendPtr("L $x $y", "input swipe $x $y $x $y 700")
               }
 
               fun rightClickOrBack() {
                   onNavKey(4)
               }
 
-              fun scrollStep(dir: Int) {
-                  val d = (tvH * 0.25f).toInt()
+              // Scroll real con rueda de ratón en el punto exacto del cursor (ideal para páginas web y listas)
+              // y fallback a DPAD paso a paso si no está el puntero activo
+              fun scrollWheel(dir: Int) {
                   val x = px()
-                  val y0 = (py() - dir * d / 2).coerceIn(20, tvH - 20)
-                  val y1 = (y0 + dir * d).coerceIn(20, tvH - 20)
-                  send("input swipe $x $y0 $x $y1 150")
+                  val y = py()
+                  // En Android MotionEvent.AXIS_VSCROLL: negativo baja la página, positivo sube
+                  val vDelta = if (dir > 0) -2.5f else 2.5f
+                  val keyCode = if (dir > 0) 20 else 19
+                  sendPtr("S $x $y $vDelta", "input keyevent $keyCode")
+              }
+
+              fun scrollSwipe(dir: Int) {
+                  if (scrollJob?.isActive == true) return
+                  scrollJob = scope.launch {
+                      try {
+                          val x = px()
+                          val d = (tvH * 0.25f).toInt()
+                          val yStart = (tvH / 2 + dir * d / 2).coerceIn(80, tvH - 80)
+                          val yEnd = (tvH / 2 - dir * d / 2).coerceIn(80, tvH - 80)
+                          Adb.shell("input swipe $x $yStart $x $yEnd 380")
+                      } catch (e: Throwable) { onMsg("Error: ${e.message}") }
+                      delay(150)
+                  }
               }
 
               @Composable
@@ -1421,7 +1492,6 @@ jobs:
                       val shape = RoundedCornerShape(16.dp)
 
                       Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                          // Touchpad: un solo detector de gestos que diferencia toque corto (tap) de arrastre (move)
                           Box(
                               Modifier
                                   .width(padW)
@@ -1453,12 +1523,11 @@ jobs:
                                               if (delta.x != 0f || delta.y != 0f) {
                                                   cx = (cx + delta.x * speed / size.width).coerceIn(0f, 1f)
                                                   cy = (cy + delta.y * speed / size.height).coerceIn(0f, 1f)
-                                                  scheduleMove(px(), py())
+                                                  moveCursor(px(), py())
                                               }
                                               if (!longTriggered && totalDist < 12f && System.currentTimeMillis() - downTime > 650) {
                                                   longTriggered = true
-                                                  val x = px(); val y = py()
-                                                  send("input swipe $x $y $x $y 700")
+                                                  longTap()
                                               }
                                           }
 
@@ -1469,11 +1538,11 @@ jobs:
                                   }
                           ) {
                               Text(
-                                  "Modo ratón",
+                                  if (pointerReady) "Puntero activo (${px()}, ${py()})" else "Modo ratón (${px()}, ${py()})",
                                   Modifier.align(Alignment.Center),
-                                  fontSize = 14.sp,
+                                  fontSize = 13.sp,
                                   fontWeight = FontWeight.Medium,
-                                  color = Color.White.copy(alpha = 0.45f)
+                                  color = Color.White.copy(alpha = 0.55f)
                               )
                               Box(
                                   Modifier
@@ -1493,12 +1562,12 @@ jobs:
                                           y = (padH - 18.dp) * cy
                                       )
                                       .size(18.dp)
-                                      .background(TvGreen, CircleShape)
+                                      .background(if (pointerReady) TvGreen else TvAmber, CircleShape)
                                       .border(2.dp, Color.White, CircleShape)
                               )
                           }
 
-                          // Franja de scroll independiente (solo hace scroll, nunca clic al tocar)
+                          // Franja de scroll con rueda de mouse real (AXIS_VSCROLL)
                           Column(
                               Modifier
                                   .width(stripW)
@@ -1510,7 +1579,7 @@ jobs:
                               verticalArrangement = Arrangement.SpaceBetween
                           ) {
                               Box(
-                                  Modifier.fillMaxWidth().height(44.dp).clickable { scrollStep(1) },
+                                  Modifier.fillMaxWidth().height(44.dp).clickable { scrollWheel(-1) },
                                   contentAlignment = Alignment.Center
                               ) { Text("⌃", fontSize = 18.sp, color = Color.White.copy(alpha = 0.8f)) }
 
@@ -1519,7 +1588,7 @@ jobs:
                                       .fillMaxWidth()
                                       .weight(1f)
                                       .pointerInput(invert) {
-                                          val step = 36.dp.toPx()
+                                          val step = 28.dp.toPx()
                                           awaitEachGesture {
                                               val down = awaitFirstDown(requireUnconsumed = false)
                                               down.consume()
@@ -1536,10 +1605,11 @@ jobs:
                                                   lastY = change.position.y
                                                   change.consume()
                                                   acc += dy
-                                                  while (abs(acc) >= step) {
-                                                      val dir = if (acc > 0f) 1 else -1
-                                                      acc -= dir * step
-                                                      scrollStep(if (invert) -dir else dir)
+                                                  if (abs(acc) >= step) {
+                                                      val rawDir = if (acc > 0f) 1 else -1
+                                                      acc = 0f
+                                                      val dir = if (invert) -rawDir else rawDir
+                                                      scrollWheel(dir)
                                                   }
                                               }
                                           }
@@ -1555,7 +1625,7 @@ jobs:
                               }
 
                               Box(
-                                  Modifier.fillMaxWidth().height(44.dp).clickable { scrollStep(-1) },
+                                  Modifier.fillMaxWidth().height(44.dp).clickable { scrollWheel(1) },
                                   contentAlignment = Alignment.Center
                               ) { Text("⌄", fontSize = 18.sp, color = Color.White.copy(alpha = 0.8f)) }
                           }
@@ -1574,6 +1644,18 @@ jobs:
                           contentAlignment = Alignment.Center
                       ) {
                           Text("Clic", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                      }
+                      Box(
+                          Modifier
+                              .weight(1f)
+                              .height(48.dp)
+                              .clip(RoundedCornerShape(10.dp))
+                              .background(Color(0xFF3A3D4A))
+                              .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(10.dp))
+                              .clickable { scrollSwipe(1) },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text("Deslizar ↓", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                       }
                       Box(
                           Modifier
@@ -2129,6 +2211,267 @@ jobs:
           include(":app")
           TVEOF
           base64 -d app/tvcontrol.keystore.b64 > app/tvcontrol.keystore
+
+      - name: Compilar helper de puntero para la TV
+        run: |
+          mkdir -p ptr_src app/src/main/assets
+          cat > ptr_src/TvPointer.java <<'PTREOF'
+          import android.app.ActivityThread;
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.PixelFormat;
+          import android.hardware.input.InputManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.view.Gravity;
+          import android.view.InputDevice;
+          import android.view.InputEvent;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.lang.reflect.Method;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+
+          public class TvPointer {
+              private static WindowManager wm;
+              private static PointerView view;
+              private static WindowManager.LayoutParams lp;
+              private static Handler mainHandler;
+              private static InputManager im;
+              private static Method injectMethod;
+              private static float curX = 960f;
+              private static float curY = 540f;
+              private static long lastActivity = System.currentTimeMillis();
+
+              static class PointerView extends View {
+                  private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Path arrow = new Path();
+
+                  public PointerView(Context ctx) {
+                      super(ctx);
+                      fill.setColor(Color.WHITE);
+                      fill.setStyle(Paint.Style.FILL);
+                      stroke.setColor(Color.BLACK);
+                      stroke.setStyle(Paint.Style.STROKE);
+                      stroke.setStrokeWidth(2.6f);
+                      stroke.setStrokeJoin(Paint.Join.ROUND);
+
+                      // Flecha clásica de mouse (punta exacta en 0,0)
+                      arrow.moveTo(0f, 0f);
+                      arrow.lineTo(0f, 34f);
+                      arrow.lineTo(8.5f, 26.5f);
+                      arrow.lineTo(14.5f, 39f);
+                      arrow.lineTo(19.5f, 36.5f);
+                      arrow.lineTo(13.5f, 24f);
+                      arrow.lineTo(24.5f, 24f);
+                      arrow.close();
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas canvas) {
+                      canvas.save();
+                      canvas.translate(2f, 2f);
+                      canvas.drawPath(arrow, fill);
+                      canvas.drawPath(arrow, stroke);
+                      canvas.restore();
+                  }
+              }
+
+              public static void main(String[] args) {
+                  try {
+                      Looper.prepareMainLooper();
+                      mainHandler = new Handler(Looper.getMainLooper());
+
+                      ActivityThread at = ActivityThread.systemMain();
+                      Context ctx = at.getSystemContext();
+
+                      im = (InputManager) ctx.getSystemService(Context.INPUT_SERVICE);
+                      injectMethod = InputManager.class.getMethod("injectInputEvent", InputEvent.class, int.class);
+
+                      wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+                      int type = Build.VERSION.SDK_INT >= 26
+                              ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                              : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT;
+
+                      lp = new WindowManager.LayoutParams(
+                              48, 56,
+                              type,
+                              WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                      | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                      | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                      | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                              PixelFormat.TRANSLUCENT
+                      );
+                      lp.gravity = Gravity.TOP | Gravity.START;
+                      lp.x = (int) curX;
+                      lp.y = (int) curY;
+                      try {
+                          lp.getClass().getField("privateFlags").setInt(lp, 0x00000010); // PRIVATE_FLAG_TRUSTED_OVERLAY
+                      } catch (Throwable ignored) {}
+
+                      view = new PointerView(ctx);
+                      wm.addView(view, lp);
+
+                      new Thread(TvPointer::runServer, "tvptr-srv").start();
+
+                      // Auto-cierre si pasa 20 minutos sin actividad
+                      mainHandler.postDelayed(new Runnable() {
+                          @Override
+                          public void run() {
+                              if (System.currentTimeMillis() - lastActivity > 20 * 60 * 1000L) {
+                                  System.exit(0);
+                              }
+                              mainHandler.postDelayed(this, 60_000L);
+                          }
+                      }, 60_000L);
+
+                      Looper.loop();
+                  } catch (Throwable t) {
+                      t.printStackTrace();
+                      System.exit(1);
+                  }
+              }
+
+              private static void moveOverlay(final float x, final float y, final boolean visible) {
+                  curX = x;
+                  curY = y;
+                  mainHandler.post(() -> {
+                      try {
+                          if (view != null && wm != null) {
+                              view.setVisibility(visible ? View.VISIBLE : View.GONE);
+                              lp.x = Math.round(x) - 2;
+                              lp.y = Math.round(y) - 2;
+                              wm.updateViewLayout(view, lp);
+                          }
+                      } catch (Throwable ignored) {}
+                  });
+              }
+
+              private static void injectMotion(int action, float x, float y, int source, int buttonState, float vScroll, long downTime) {
+                  try {
+                      long now = SystemClock.uptimeMillis();
+                      MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
+                      props[0] = new MotionEvent.PointerProperties();
+                      props[0].id = 0;
+                      props[0].toolType = (source == InputDevice.SOURCE_MOUSE)
+                              ? MotionEvent.TOOL_TYPE_MOUSE
+                              : MotionEvent.TOOL_TYPE_FINGER;
+
+                      MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
+                      coords[0] = new MotionEvent.PointerCoords();
+                      coords[0].x = x;
+                      coords[0].y = y;
+                      coords[0].pressure = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_HOVER_MOVE || action == MotionEvent.ACTION_SCROLL) ? 0f : 1f;
+                      coords[0].size = 1f;
+                      if (vScroll != 0f) {
+                          coords[0].setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll);
+                      }
+
+                      MotionEvent ev = MotionEvent.obtain(
+                              downTime, now, action,
+                              1, props, coords,
+                              0, buttonState,
+                              1f, 1f,
+                              0, 0, source, 0
+                      );
+                      injectMethod.invoke(im, ev, 0);
+                      ev.recycle();
+                  } catch (Throwable ignored) {}
+              }
+
+              private static void doHover(float x, float y) {
+                  moveOverlay(x, y, true);
+                  long now = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_HOVER_MOVE, x, y, InputDevice.SOURCE_MOUSE, 0, 0f, now);
+              }
+
+              private static void doClick(float x, float y) {
+                  moveOverlay(x, y, true);
+                  long down = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+                  SystemClock.sleep(35);
+                  injectMotion(MotionEvent.ACTION_UP, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+              }
+
+              private static void doLongClick(float x, float y) {
+                  moveOverlay(x, y, true);
+                  long down = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+                  SystemClock.sleep(650);
+                  injectMotion(MotionEvent.ACTION_UP, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
+              }
+
+              private static void doWheelScroll(float x, float y, float delta) {
+                  moveOverlay(x, y, true);
+                  long now = SystemClock.uptimeMillis();
+                  injectMotion(MotionEvent.ACTION_SCROLL, x, y, InputDevice.SOURCE_MOUSE, 0, delta, now);
+              }
+
+              private static void runServer() {
+                  try (ServerSocket ss = new ServerSocket(15556)) {
+                      while (true) {
+                          Socket s = ss.accept();
+                          new Thread(() -> handleClient(s)).start();
+                      }
+                  } catch (Throwable t) {
+                      t.printStackTrace();
+                      System.exit(1);
+                  }
+              }
+
+              private static void handleClient(Socket s) {
+                  try (BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()));
+                       OutputStream out = s.getOutputStream()) {
+                      String line;
+                      while ((line = br.readLine()) != null) {
+                          lastActivity = System.currentTimeMillis();
+                          String[] p = line.trim().split(" ");
+                          if (p.length == 0) continue;
+                          switch (p[0]) {
+                              case "PING":
+                                  out.write("PONG\n".getBytes());
+                                  out.flush();
+                                  break;
+                              case "M":
+                                  if (p.length >= 3) doHover(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
+                                  break;
+                              case "C":
+                                  if (p.length >= 3) doClick(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
+                                  break;
+                              case "L":
+                                  if (p.length >= 3) doLongClick(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
+                                  break;
+                              case "S":
+                                  if (p.length >= 4) doWheelScroll(Float.parseFloat(p[1]), Float.parseFloat(p[2]), Float.parseFloat(p[3]));
+                                  break;
+                              case "H":
+                                  moveOverlay(curX, curY, false);
+                                  break;
+                              case "Q":
+                                  System.exit(0);
+                                  break;
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+              }
+          }
+          PTREOF
+          ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
+          D8_BIN=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -n 1)
+          javac --release 8 -cp "$ANDROID_JAR" -d ptr_src ptr_src/TvPointer.java
+          "$D8_BIN" --min-api 21 --output app/src/main/assets ptr_src/*.class
+          mv app/src/main/assets/classes.dex app/src/main/assets/tvptr.dex
+          ls -lh app/src/main/assets/tvptr.dex
 
       - name: Compilar
         run: gradle assembleDebug --stacktrace
