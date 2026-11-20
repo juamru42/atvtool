@@ -35,7 +35,7 @@ jobs:
                   targetSdk = 34
                   // sube sola en cada compilación de GitHub, así se puede actualizar sin desinstalar
                   versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
-                  versionName = "1.2"
+                  versionName = "1.0"
               }
 
               signingConfigs {
@@ -92,6 +92,9 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+
               <application
                   android:allowBackup="false"
                   android:icon="@mipmap/ic_launcher"
@@ -111,6 +114,22 @@ jobs:
                       android:name=".ConnService"
                       android:exported="false"
                       android:foregroundServiceType="dataSync" />
+                  <service
+                      android:name=".PointerService"
+                      android:exported="true"
+                      android:label="TV Control · Puntero"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/pointer_service" />
+                  </service>
+                  <receiver
+                      android:name=".SetupReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.DUMP" />
               </application>
           </manifest>
           TVEOF
@@ -135,18 +154,25 @@ jobs:
           import java.io.File
           import java.io.IOException
 
+          /**
+           * Capa fina sobre dadb. Todas las llamadas corren en Dispatchers.IO.
+           * Si la conexión se cae (Broken pipe, reset, etc.) se reconecta sola y repite la llamada una vez.
+           */
           object Adb {
               @Volatile
               private var dadb: Dadb? = null
               private var appCtx: Context? = null
               @Volatile
-              var host: String = ""
-                  private set
+              private var host: String = ""
               private var port: Int = 5555
               private val reconnectLock = Mutex()
 
               val connected: Boolean get() = dadb != null
 
+              /** IP de la TV a la que estamos conectados. */
+              val currentHost: String get() = host
+
+              /** Estado observable por la interfaz (se actualiza también al desconectar desde la notificación). */
               var isUp by mutableStateOf(false)
                   private set
 
@@ -157,10 +183,11 @@ jobs:
                   return AdbKeyPair.read(priv, pub)
               }
 
+              /** La primera vez la TV muestra "¿Permitir depuración USB?": hay que aceptar. */
               suspend fun connect(ctx: Context, host: String, port: Int) = withContext(Dispatchers.IO) {
                   disconnect()
                   val d = Dadb.create(host, port, keys(ctx))
-                  d.shell("echo ok")
+                  d.shell("echo ok") // fuerza la autenticación
                   appCtx = ctx.applicationContext
                   this@Adb.host = host
                   this@Adb.port = port
@@ -168,6 +195,7 @@ jobs:
                   isUp = true
               }
 
+              /** Desconexión pedida por el usuario: no se reconecta sola. */
               fun disconnect() {
                   host = ""
                   runCatching { dadb?.close() }
@@ -175,25 +203,11 @@ jobs:
                   isUp = false
               }
 
+              /** Cualquier error de E/S cuenta como conexión caída, salvo un fallo de instalación del APK. */
               private fun isLinkError(e: Throwable): Boolean {
-                  if (e is CancellationException) return false
-                  val m = ((e.message ?: "") + " " + (e.cause?.message ?: "")).lowercase()
-                  if (m.contains("failure") || m.contains("install_")) return false
-                  return e is IOException || e is IllegalStateException ||
-                      m.contains("closed") || m.contains("eof") || m.contains("broken pipe") ||
-                      m.contains("reset") || m.contains("timeout") || m.contains("stream")
-              }
-
-              suspend fun reconnect(): Unit = withContext(Dispatchers.IO) {
-                  val ctx = appCtx ?: error("Sin contexto")
-                  if (host.isEmpty()) error("No conectado")
-                  reconnectLock.withLock {
-                      runCatching { dadb?.close() }
-                      val d = Dadb.create(host, port, keys(ctx))
-                      d.shell("echo ok")
-                      dadb = d
-                      isUp = true
-                  }
+                  if (e !is IOException && e !is IllegalStateException) return false
+                  val m = (e.message ?: "").lowercase()
+                  return !(m.contains("failure") || m.contains("install_"))
               }
 
               private suspend fun <T> call(block: (Dadb) -> T): T = withContext(Dispatchers.IO) {
@@ -206,7 +220,7 @@ jobs:
                       val fresh = reconnectLock.withLock {
                           val cur = dadb
                           if (cur != null && cur !== first) {
-                              cur
+                              cur // otra llamada ya reconectó
                           } else {
                               runCatching { first.close() }
                               val d = Dadb.create(host, port, keys(ctx))
@@ -223,6 +237,7 @@ jobs:
 
               suspend fun shell(cmd: String): String = call { it.shell(cmd).allOutput }
 
+              /** Para comandos que cortan la conexión a propósito (reiniciar): sin reconexión ni reintento. */
               suspend fun shellOnce(cmd: String): String = withContext(Dispatchers.IO) {
                   (dadb ?: error("No conectado")).shell(cmd).allOutput
               }
@@ -236,6 +251,8 @@ jobs:
               suspend fun key(code: Int) = shell("input keyevent $code")
           }
 
+          // ---------- utilidades de archivos locales / Uri ----------
+
           fun displayName(cr: ContentResolver, uri: Uri): String {
               cr.query(uri, null, null, null, null)?.use { c ->
                   val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
@@ -244,6 +261,7 @@ jobs:
               return uri.lastPathSegment?.substringAfterLast('/') ?: "archivo"
           }
 
+          /** Copia un Uri elegido con el selector del sistema a la caché de la app. */
           suspend fun copyUriToCache(ctx: Context, uri: Uri): File = withContext(Dispatchers.IO) {
               val dir = File(ctx.cacheDir, "up").apply { mkdirs() }
               val out = File(dir, displayName(ctx.contentResolver, uri))
@@ -445,6 +463,10 @@ jobs:
           import android.os.Build
           import android.os.IBinder
 
+          /**
+           * Servicio en primer plano: muestra la notificación "Conectado a …", evita que Android
+           * cierre la app en segundo plano y mantiene el wifi activo mientras hay conexión con la TV.
+           */
           class ConnService : Service() {
               private var wifiLock: WifiManager.WifiLock? = null
 
@@ -567,7 +589,7 @@ jobs:
               fun load() = scope.launch {
                   val p = UiState.filesPath
                   val out = try { Adb.shell("ls -1Ap ${Adb.q(p)} 2>&1") } catch (e: Throwable) { "Error: ${e.message}" }
-                  if (p != UiState.filesPath) return@launch
+                  if (p != UiState.filesPath) return@launch // el usuario ya cambió de carpeta
                   if (out.contains("No such file") || out.contains("Permission denied") || out.startsWith("Error")) {
                       msg = out.trim(); entries = emptyList()
                   } else {
@@ -577,6 +599,7 @@ jobs:
                   }
               }
 
+              // Al llegar a una carpeta (o volver a ella) se restaura donde estaba el scroll.
               LaunchedEffect(entries) {
                   if (entries.isNotEmpty() && lastPath != UiState.filesPath) {
                       lastPath = UiState.filesPath
@@ -585,6 +608,7 @@ jobs:
                   }
               }
 
+              // Al cambiar de pestaña se guarda la posición para retomarla al volver.
               DisposableEffect(Unit) { onDispose { savePos() } }
 
               val upload = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -683,10 +707,279 @@ jobs:
           }
           TVEOF
           mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/HomeScreen.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import android.content.Intent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          @Composable
+          fun HomeScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val prefs = remember { ctx.getSharedPreferences("tv", 0) }
+              val lastHost = remember { prefs.getString("host", "") ?: "" }
+              var host by remember { mutableStateOf(lastHost) }
+              var port by remember { mutableStateOf(prefs.getString("port", "5555") ?: "5555") }
+              var busyHost by remember { mutableStateOf<String?>(null) }
+              var error by remember { mutableStateOf("") }
+              var scanning by remember { mutableStateOf(false) }
+              var progress by remember { mutableFloatStateOf(0f) }
+              var devices by remember { mutableStateOf(listOf<Dev>()) }
+              var showManual by remember { mutableStateOf(false) }
+              val myIp = remember { Net.localIp() }
+              val prefix = myIp?.substringBeforeLast('.')
+
+              fun connect(h: String, p: Int) {
+                  if (busyHost != null) return
+                  busyHost = h
+                  error = ""
+                  scope.launch {
+                      try {
+                          Adb.connect(ctx, h, p)
+                          prefs.edit().putString("host", h).putString("port", p.toString()).apply()
+                          ContextCompat.startForegroundService(
+                              ctx, Intent(ctx, ConnService::class.java).putExtra("host", h)
+                          )
+                      } catch (e: Throwable) {
+                          error = "No se pudo conectar a $h: ${e.message}. ¿Está activada la depuración por red en la TV?"
+                      }
+                      busyHost = null
+                  }
+              }
+
+              fun scan() {
+                  if (scanning) return
+                  if (prefix == null) {
+                      error = "No hay conexión wifi. Conectate a la misma red que la TV."
+                      return
+                  }
+                  scanning = true
+                  progress = 0f
+                  devices = emptyList()
+                  error = ""
+                  val sc = Scanner()
+                  scope.launch {
+                      val ticker = launch {
+                          while (true) {
+                              delay(350)
+                              devices = sc.snapshot(myIp)
+                              progress = sc.progress
+                          }
+                      }
+                      try {
+                          withContext(Dispatchers.Default) { sc.run(prefix) }
+                      } catch (e: CancellationException) {
+                          throw e
+                      } catch (e: Throwable) {
+                          error = "Error al buscar: ${e.message}"
+                      }
+                      ticker.cancel()
+                      devices = sc.snapshot(myIp)
+                      progress = 1f
+                      scanning = false
+                  }
+              }
+
+              LaunchedEffect(Unit) { scan() }
+
+              val sorted = devices.sortedWith(
+                  compareBy<Dev>(
+                      {
+                          when {
+                              it.me -> 3
+                              5555 in it.ports || it.ip == lastHost -> 0
+                              8009 in it.ports || 8008 in it.ports -> 1
+                              else -> 2
+                          }
+                      },
+                      { Net.ipKey(it.ip) }
+                  )
+              )
+
+              Column(Modifier.fillMaxSize().systemBarsPadding()) {
+                  // Cabecera con degradado
+                  Box(
+                      Modifier
+                          .fillMaxWidth()
+                          .background(
+                              Brush.linearGradient(listOf(Color(0xFF1D4ED8), Color(0xFF7C3AED))),
+                              RoundedCornerShape(bottomStart = 28.dp, bottomEnd = 28.dp)
+                          )
+                          .padding(horizontal = 20.dp, vertical = 22.dp)
+                  ) {
+                      Column {
+                          Text("📺 TV Control", style = MaterialTheme.typography.headlineMedium,
+                              color = Color.White, fontWeight = FontWeight.Bold)
+                          Text("Controlá tus Android TV desde el teléfono", color = Color.White.copy(alpha = 0.85f))
+                          Spacer(Modifier.height(10.dp))
+                          Text(
+                              if (myIp != null) "📶 Tu teléfono: $myIp   ·   Red $prefix.x" else "📶 Sin conexión wifi",
+                              color = Color.White.copy(alpha = 0.9f), fontSize = 13.sp
+                          )
+                      }
+                  }
+
+                  Column(Modifier.weight(1f).padding(horizontal = 16.dp, vertical = 12.dp)) {
+                      if (lastHost.isNotBlank()) {
+                          Btn3D(
+                              "⭐ Reconectar a $lastHost",
+                              { connect(lastHost, prefs.getString("port", "5555")?.toIntOrNull() ?: 5555) },
+                              Modifier.fillMaxWidth(), color = TvPurple, enabled = busyHost == null, wide = true
+                          )
+                          Spacer(Modifier.height(4.dp))
+                      }
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Column(Modifier.weight(1f)) {
+                              Text("Dispositivos en la red", style = MaterialTheme.typography.titleMedium,
+                                  fontWeight = FontWeight.Bold)
+                              Text(
+                                  if (scanning) "Buscando… ${devices.size} encontrados" else "${devices.size} encontrados",
+                                  style = MaterialTheme.typography.bodySmall,
+                                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                              )
+                          }
+                          Btn3D(if (scanning) "Buscando…" else "🔍 Buscar", { scan() }, enabled = !scanning, small = true)
+                      }
+                      if (scanning) {
+                          LinearProgressIndicator(
+                              progress = { progress },
+                              modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                          )
+                      }
+                      if (error.isNotEmpty()) {
+                          Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                      }
+                      LazyColumn(
+                          Modifier.weight(1f).fillMaxWidth().padding(top = 6.dp),
+                          verticalArrangement = Arrangement.spacedBy(10.dp)
+                      ) {
+                          items(sorted, key = { it.ip }) { d ->
+                              DeviceCard(d, isLast = d.ip == lastHost, busy = busyHost == d.ip, enabled = busyHost == null) {
+                                  connect(d.ip, 5555)
+                              }
+                          }
+                          if (!scanning && sorted.isEmpty()) {
+                              item {
+                                  Text(
+                                      "No se encontró ningún aparato. Revisá que el teléfono y la TV estén en la misma wifi y tocá Buscar.",
+                                      style = MaterialTheme.typography.bodySmall
+                                  )
+                              }
+                          }
+                      }
+                  }
+
+                  // Conexión manual
+                  Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp)) {
+                      Btn3D(
+                          if (showManual) "▾ Ocultar conexión manual" else "✏ Conectar manualmente",
+                          { showManual = !showManual }, color = TvSlate, small = true
+                      )
+                      if (showManual) {
+                          Panel {
+                              OutlinedTextField(host, { host = it }, label = { Text("IP de la TV") },
+                                  singleLine = true, modifier = Modifier.fillMaxWidth())
+                              Spacer(Modifier.height(6.dp))
+                              OutlinedTextField(port, { port = it }, label = { Text("Puerto") },
+                                  singleLine = true, modifier = Modifier.fillMaxWidth())
+                              Spacer(Modifier.height(10.dp))
+                              Btn3D(
+                                  if (busyHost != null) "Conectando… (aceptá el aviso en la TV)" else "Conectar",
+                                  { connect(host.trim(), port.trim().toIntOrNull() ?: 5555) },
+                                  Modifier.fillMaxWidth(), color = TvGreen,
+                                  enabled = busyHost == null && host.isNotBlank(), wide = true
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun DeviceCard(d: Dev, isLast: Boolean, busy: Boolean, enabled: Boolean, onConnect: () -> Unit) {
+              val kind = Net.kindOf(d)
+              val adb = 5555 in d.ports
+              val cast = 8009 in d.ports || 8008 in d.ports
+              val shape = RoundedCornerShape(18.dp)
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .background(TvSurface, shape)
+                      .border(1.dp, if (adb) TvGreen.copy(alpha = 0.55f) else Color.White.copy(alpha = 0.08f), shape)
+                      .padding(12.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Box(
+                      Modifier
+                          .size(48.dp)
+                          .background(
+                              Brush.linearGradient(
+                                  if (adb) listOf(Color(0xFF16A34A), Color(0xFF0E7490))
+                                  else listOf(Color(0xFF334155), Color(0xFF1E293B))
+                              ),
+                              CircleShape
+                          ),
+                      contentAlignment = Alignment.Center
+                  ) { Text(kind.icon, fontSize = 22.sp) }
+                  Spacer(Modifier.width(12.dp))
+                  Column(Modifier.weight(1f)) {
+                      Text(
+                          (d.name ?: kind.label) + if (isLast) "  ⭐" else "",
+                          fontWeight = FontWeight.SemiBold, maxLines = 1
+                      )
+                      Text(
+                          d.ip + if (d.name != null) "  ·  ${kind.label}" else "",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f), maxLines = 1
+                      )
+                      val svc = Net.servicesOf(d)
+                      if (svc.isNotEmpty()) {
+                          Text(svc, fontSize = 11.sp, color = TvBlue)
+                      }
+                      if (cast && !adb) {
+                          Text("ADB apagado: activá la depuración por red en la TV",
+                              fontSize = 11.sp, color = TvAmber)
+                      }
+                  }
+                  if (!d.me) {
+                      Spacer(Modifier.width(8.dp))
+                      Btn3D(
+                          if (busy) "…" else if (adb) "Conectar" else "Probar",
+                          onConnect, color = if (adb) TvGreen else TvSlate, enabled = enabled, small = true
+                      )
+                  }
+              }
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
           cat > app/src/main/java/com/tvcontrol/Icons.kt <<'TVEOF'
           package com.tvcontrol
 
           import android.content.Context
+          import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
@@ -724,6 +1017,11 @@ jobs:
 
           class Meta(val icon: ImageBitmap, val label: String?)
 
+          /**
+           * Obtiene el ícono y el nombre de una app instalada en la TV: baja su APK,
+           * lo lee con PackageManager y guarda el resultado en caché (no se vuelve a bajar).
+           * Se hace de a una app por vez y solo para las que se ven en pantalla.
+           */
           object IconStore {
               private val lock = Mutex()
               private val mem = ConcurrentHashMap<String, Meta>()
@@ -773,7 +1071,7 @@ jobs:
                       ai.publicSourceDir = tmp.path
                       val bmp = ai.loadIcon(pm).toBitmap(96, 96)
                       val label = ai.loadLabel(pm).toString()
-                      File(dir, "$pkg.png").outputStream().use { bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+                      File(dir, "$pkg.png").outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
                       File(dir, "$pkg.txt").writeText(label)
                       val meta = Meta(bmp.asImageBitmap(), label)
                       mem[pkg] = meta
@@ -846,6 +1144,7 @@ jobs:
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
           import androidx.core.content.ContextCompat
           import kotlinx.coroutines.launch
 
@@ -872,41 +1171,27 @@ jobs:
               var error by remember { mutableStateOf("") }
               var tab by remember { mutableIntStateOf(0) }
 
+              // Permiso para mostrar la notificación de conexión (Android 13+)
               val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
               LaunchedEffect(Unit) {
                   if (Build.VERSION.SDK_INT >= 33) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
               }
+              // Al desconectarse (desde la app, la notificación o por reinicio de la TV) se quita la notificación.
               LaunchedEffect(connected) {
                   if (!connected) ctx.stopService(Intent(ctx, ConnService::class.java))
               }
 
+              // Atrás: primero sube de carpeta, después vuelve a Apps; recién ahí sale de la app.
               BackHandler(enabled = connected && tab != 0) {
                   if (tab == 1 && UiState.canUp()) UiState.up() else tab = 0
               }
 
               if (!connected) {
-                  ConnectScreen(host, port, busy, error) { h, p ->
-                      host = h
-                      port = p.toString()
-                      busy = true
-                      error = ""
-                      scope.launch {
-                          try {
-                              Adb.connect(ctx, h, p)
-                              prefs.edit().putString("host", h).putString("port", p.toString()).apply()
-                              ContextCompat.startForegroundService(
-                                  ctx, Intent(ctx, ConnService::class.java).putExtra("host", h)
-                              )
-                          } catch (e: Throwable) {
-                              error = "No se pudo conectar: ${e.message}"
-                          }
-                          busy = false
-                      }
-                  }
+                  HomeScreen()
                   return
               }
 
-              val tabs = listOf("📦" to "Apps", "📁" to "Archivos", "🎮" to "Remoto", "📊" to "Monitor", "⌨" to "Shell")
+              val tabs = listOf("📦" to "Apps", "📁" to "Archivos", "🎮" to "Remoto", "🖱" to "Mouse", "📊" to "Monitor", "⌨" to "Shell")
               Scaffold(
                   topBar = {
                       Row(
@@ -914,7 +1199,7 @@ jobs:
                           verticalAlignment = Alignment.CenterVertically,
                           horizontalArrangement = Arrangement.SpaceBetween
                       ) {
-                          Text("● $host", style = MaterialTheme.typography.titleSmall, color = TvGreen)
+                          Text("● ${Adb.currentHost}", style = MaterialTheme.typography.titleSmall, color = TvGreen)
                           Btn3D("Desconectar", { Adb.disconnect() }, color = TvSlate, small = true)
                       }
                   },
@@ -923,7 +1208,7 @@ jobs:
                           tabs.forEachIndexed { i, (icon, label) ->
                               NavigationBarItem(
                                   selected = tab == i, onClick = { tab = i },
-                                  icon = { Text(icon) }, label = { Text(label) }
+                                  icon = { Text(icon) }, label = { Text(label, fontSize = 10.sp, maxLines = 1) }
                               )
                           }
                       }
@@ -934,7 +1219,8 @@ jobs:
                           0 -> AppsScreen()
                           1 -> FilesScreen()
                           2 -> RemoteScreen()
-                          3 -> MonitorScreen()
+                          3 -> TouchpadScreen()
+                          4 -> MonitorScreen()
                           else -> ShellScreen()
                       }
                   }
@@ -1030,7 +1316,6 @@ jobs:
                   mutableStateOf((prefs.getString("marks", "") ?: "").lines().filter { it.isNotBlank() })
               }
               var running by remember { mutableStateOf(false) }
-              var activeJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
               fun saveMarks(l: List<String>) {
                   marks = l
@@ -1038,31 +1323,12 @@ jobs:
               }
 
               fun exec(c: String) {
-                  if (c.isBlank()) return
-                  activeJob?.cancel()
+                  if (c.isBlank() || running) return
                   running = true
-                  activeJob = scope.launch {
-                      try {
-                          val out = kotlinx.coroutines.withTimeoutOrNull(15_000L) {
-                              try {
-                                  Adb.shell(c)
-                              } catch (e: Throwable) {
-                                  if (e is kotlinx.coroutines.CancellationException) throw e
-                                  runCatching { Adb.reconnect() }
-                                  Adb.shell(c)
-                              }
-                          } ?: "Timeout (15 s): el comando siguió abierto o no respondió. Reconectando ADB…"
-                          if (out.startsWith("Timeout (15 s)")) {
-                              runCatching { Adb.reconnect() }
-                          }
-                          UiState.shellLog = "$ $c\n$out\n${UiState.shellLog}"
-                      } catch (e: kotlinx.coroutines.CancellationException) {
-                          UiState.shellLog = "$ $c\n[Cancelado]\n${UiState.shellLog}"
-                      } catch (e: Throwable) {
-                          UiState.shellLog = "$ $c\nError: ${e.message}\n${UiState.shellLog}"
-                      } finally {
-                          running = false
-                      }
+                  scope.launch {
+                      val out = try { Adb.shell(c) } catch (e: Throwable) { "Error: ${e.message}" }
+                      UiState.shellLog = "$ $c\n$out\n${UiState.shellLog}"
+                      running = false
                   }
               }
 
@@ -1070,15 +1336,7 @@ jobs:
                   Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       OutlinedTextField(UiState.shellCmd, { UiState.shellCmd = it }, label = { Text("Comando shell") },
                           singleLine = true, modifier = Modifier.weight(1f))
-                      if (running) {
-                          Btn3D("Detener", {
-                              activeJob?.cancel()
-                              running = false
-                              scope.launch { runCatching { Adb.reconnect() } }
-                          }, color = TvRed, small = true)
-                      } else {
-                          Btn3D("Ejecutar", { exec(UiState.shellCmd) }, color = TvGreen, enabled = UiState.shellCmd.isNotBlank(), small = true)
-                      }
+                      Btn3D("Ejecutar", { exec(UiState.shellCmd) }, color = TvGreen, enabled = !running && UiState.shellCmd.isNotBlank(), small = true)
                   }
                   Spacer(Modifier.height(8.dp))
                   Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1125,6 +1383,584 @@ jobs:
           }
           TVEOF
           mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/Pointer.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import android.content.Context
+          import androidx.core.content.pm.PackageInfoCompat
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.channels.Channel
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.util.UUID
+
+          private const val SERVICE = "com.tvcontrol/com.tvcontrol.PointerService"
+
+          /** Conexión abierta con el puntero de la TV. Los comandos se juntan y se envían en segundo plano. */
+          class PointerSession(
+              private val sock: Socket,
+              val w: Int,
+              val h: Int,
+              startX: Float,
+              startY: Float
+          ) {
+              @Volatile
+              var x = startX
+
+              @Volatile
+              var y = startY
+
+              @Volatile
+              var alive = true
+
+              private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+              private val ch = Channel<String>(Channel.UNLIMITED)
+
+              init {
+                  scope.launch {
+                      try {
+                          val out = sock.getOutputStream()
+                          while (true) {
+                              val batch = ArrayList<String>()
+                              batch.add(ch.receive())
+                              while (true) {
+                                  val n = ch.tryReceive().getOrNull() ?: break
+                                  batch.add(n)
+                              }
+                              val sb = StringBuilder()
+                              var mdx = 0f
+                              var mdy = 0f
+                              var wdx = 0f
+                              var wdy = 0f
+                              for (c in batch) {
+                                  val p = c.split(' ')
+                                  when (p[0]) {
+                                      "M" -> {
+                                          mdx += p[1].toFloat()
+                                          mdy += p[2].toFloat()
+                                      }
+                                      "W" -> {
+                                          wdx += p[1].toFloat()
+                                          wdy += p[2].toFloat()
+                                      }
+                                      else -> {
+                                          if (mdx != 0f || mdy != 0f) {
+                                              sb.append("M ").append(mdx).append(' ').append(mdy).append('\n')
+                                              mdx = 0f
+                                              mdy = 0f
+                                          }
+                                          if (wdx != 0f || wdy != 0f) {
+                                              sb.append("W ").append(wdx).append(' ').append(wdy).append('\n')
+                                              wdx = 0f
+                                              wdy = 0f
+                                          }
+                                          sb.append(c).append('\n')
+                                      }
+                                  }
+                              }
+                              if (mdx != 0f || mdy != 0f) sb.append("M ").append(mdx).append(' ').append(mdy).append('\n')
+                              if (wdx != 0f || wdy != 0f) sb.append("W ").append(wdx).append(' ').append(wdy).append('\n')
+                              out.write(sb.toString().toByteArray())
+                              out.flush()
+                          }
+                      } catch (e: Exception) {
+                          alive = false
+                      }
+                  }
+              }
+
+              fun send(cmd: String) {
+                  ch.trySend(cmd)
+              }
+
+              /** Mueve el puntero (en píxeles de la TV) y recuerda su posición para dibujarlo en el teléfono. */
+              fun move(dx: Float, dy: Float) {
+                  x = (x + dx).coerceIn(0f, w - 1f)
+                  y = (y + dy).coerceIn(0f, h - 1f)
+                  ch.trySend("M $dx $dy")
+              }
+
+              fun close() {
+                  alive = false
+                  scope.cancel()
+                  try {
+                      sock.close()
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+
+          object PointerSetup {
+              private fun token(ctx: Context): String {
+                  val p = ctx.getSharedPreferences("tv", 0)
+                  val cur = p.getString("ptoken", null)
+                  if (cur != null) return cur
+                  val t = UUID.randomUUID().toString().replace("-", "").take(20)
+                  p.edit().putString("ptoken", t).apply()
+                  return t
+              }
+
+              private fun versionOf(ctx: Context): Long =
+                  PackageInfoCompat.getLongVersionCode(ctx.packageManager.getPackageInfo(ctx.packageName, 0))
+
+              private fun tryConnect(host: String, tok: String, ver: Long): PointerSession? {
+                  val s = Socket()
+                  try {
+                      s.tcpNoDelay = true
+                      s.connect(InetSocketAddress(host, POINTER_PORT), 1500)
+                      s.soTimeout = 2500
+                      val out = s.getOutputStream()
+                      out.write("AUTH $tok\n".toByteArray())
+                      out.flush()
+                      val line = s.getInputStream().bufferedReader().readLine()
+                      if (line == null) {
+                          s.close()
+                          return null
+                      }
+                      val p = line.split(' ')
+                      if (p.size < 6 || p[0] != "OK" || p[5].toLongOrNull() != ver) {
+                          // clave incorrecta o versión distinta en la TV: hay que (re)instalar
+                          s.close()
+                          return null
+                      }
+                      s.soTimeout = 0
+                      return PointerSession(s, p[1].toInt(), p[2].toInt(), p[3].toFloat(), p[4].toFloat())
+                  } catch (e: Exception) {
+                      try {
+                          s.close()
+                      } catch (e2: Exception) {
+                      }
+                      return null
+                  }
+              }
+
+              private fun listCommand(list: List<String>): String =
+                  if (list.isEmpty()) "settings delete secure enabled_accessibility_services"
+                  else "settings put secure enabled_accessibility_services ${Adb.q(list.joinToString(":"))}"
+
+              private suspend fun currentServices(): List<String> {
+                  val cur = Adb.shell("settings get secure enabled_accessibility_services").trim()
+                  if (cur.isEmpty() || cur == "null") return emptyList()
+                  return cur.split(':').filter { it.isNotBlank() }
+              }
+
+              private suspend fun enableService(force: Boolean) {
+                  val list = currentServices()
+                  if (force && SERVICE in list) {
+                      // apagar y volver a encender para que la TV reinicie el servicio
+                      Adb.shell(listCommand(list.filter { it != SERVICE }))
+                      delay(600)
+                  }
+                  val now = currentServices()
+                  if (SERVICE !in now) Adb.shell(listCommand(now + SERVICE))
+                  Adb.shell("settings put secure accessibility_enabled 1")
+              }
+
+              /**
+               * Abre la sesión con el puntero de la TV. Si todavía no está listo, instala la app en la TV,
+               * le pasa la clave y activa el servicio de accesibilidad, todo por ADB.
+               */
+              suspend fun open(ctx: Context, host: String, status: (String) -> Unit): PointerSession =
+                  withContext(Dispatchers.IO) {
+                      val tok = token(ctx)
+                      val ver = versionOf(ctx)
+                      tryConnect(host, tok, ver)?.let { return@withContext it }
+
+                      val pkg = ctx.packageName
+                      status("Revisando la TV…")
+                      val tvVer = Regex("versionCode=(\\d+)")
+                          .find(Adb.shell("dumpsys package $pkg | grep -m1 versionCode"))
+                          ?.groupValues?.get(1)?.toLongOrNull()
+                      if (tvVer != ver) {
+                          status("Instalando el puntero en la TV (puede tardar un minuto)…")
+                          val remote = "/data/local/tmp/tvcontrol.apk"
+                          Adb.push(File(ctx.applicationInfo.sourceDir), remote)
+                          var out = Adb.shell("pm install -r -d $remote 2>&1")
+                          if (out.contains("INCOMPATIBLE", ignoreCase = true) || out.contains("signatures", ignoreCase = true)) {
+                              Adb.shell("pm uninstall $pkg")
+                              out = Adb.shell("pm install -r -d $remote 2>&1")
+                          }
+                          Adb.shell("rm -f $remote")
+                          if (!out.contains("Success")) {
+                              error("La TV no dejó instalar el puntero: ${out.trim().take(160)}")
+                          }
+                      }
+
+                      status("Activando el puntero…")
+                      Adb.shell("am broadcast -n $pkg/.SetupReceiver --es token ${Adb.q(tok)}")
+                      enableService(false)
+                      for (i in 0 until 10) {
+                          delay(700)
+                          tryConnect(host, tok, ver)?.let { return@withContext it }
+                          if (i == 4) {
+                              status("Reiniciando el servicio en la TV…")
+                              enableService(true)
+                          }
+                      }
+                      error(
+                          "No se pudo activar el puntero. En la TV, abrí Ajustes → Accesibilidad y activá " +
+                              "“TV Control · Puntero”, o instalá de nuevo la app."
+                      )
+                  }
+
+              /** Quita el servicio de accesibilidad de la TV (el puntero desaparece). */
+              suspend fun disable() {
+                  try {
+                      val list = currentServices()
+                      if (SERVICE in list) Adb.shell(listCommand(list.filter { it != SERVICE }))
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/PointerService.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import androidx.core.content.pm.PackageInfoCompat
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.util.concurrent.atomic.AtomicInteger
+          import kotlin.math.abs
+          import kotlin.math.hypot
+
+          const val POINTER_PORT = 5577
+
+          /** Recibe (por ADB) la clave con la que el teléfono se identifica. Solo la shell de ADB puede enviarla. */
+          class SetupReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  val t = intent.getStringExtra("token") ?: return
+                  context.getSharedPreferences("ptr", Context.MODE_PRIVATE).edit().putString("token", t).apply()
+              }
+          }
+
+          /**
+           * Corre en la TV (la app se instala en la TV desde el teléfono). Dibuja un puntero encima de
+           * todo y, cuando el teléfono lo pide, hace toques, toques largos, scroll y botones del sistema.
+           */
+          class PointerService : AccessibilityService() {
+              private val ui = Handler(Looper.getMainLooper())
+              private var wm: WindowManager? = null
+              private var cursor: CursorView? = null
+
+              @Volatile
+              private var server: ServerSocket? = null
+
+              @Volatile
+              private var running = false
+              private val clients = AtomicInteger(0)
+
+              private var sw = 1920
+              private var sh = 1080
+              private var cx = 960f
+              private var cy = 540f
+              private var scrollDx = 0f
+              private var scrollDy = 0f
+              private var scrollPending = false
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  cleanup()
+                  val w = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  wm = w
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  w.defaultDisplay.getRealMetrics(dm)
+                  sw = dm.widthPixels
+                  sh = dm.heightPixels
+                  cx = sw / 2f
+                  cy = sh / 2f
+
+                  val v = CursorView(this)
+                  v.visibility = View.GONE
+                  v.setPos(cx, cy)
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  w.addView(v, lp)
+                  cursor = v
+                  startServer()
+              }
+
+              private fun startServer() {
+                  running = true
+                  Thread {
+                      try {
+                          val ss = ServerSocket()
+                          ss.reuseAddress = true
+                          ss.bind(InetSocketAddress(POINTER_PORT))
+                          server = ss
+                          while (running) {
+                              val s = ss.accept()
+                              Thread { handle(s) }.start()
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }.start()
+              }
+
+              private fun handle(s: Socket) {
+                  var counted = false
+                  try {
+                      s.tcpNoDelay = true
+                      s.soTimeout = 4000
+                      val r = s.getInputStream().bufferedReader()
+                      val tok = getSharedPreferences("ptr", Context.MODE_PRIVATE).getString("token", "") ?: ""
+                      val first = r.readLine() ?: return
+                      if (tok.isEmpty() || first != "AUTH $tok") return
+                      s.soTimeout = 0
+                      val ver = PackageInfoCompat.getLongVersionCode(packageManager.getPackageInfo(packageName, 0))
+                      val out = s.getOutputStream()
+                      out.write("OK $sw $sh ${cx.toInt()} ${cy.toInt()} $ver\n".toByteArray())
+                      out.flush()
+                      counted = true
+                      if (clients.incrementAndGet() == 1) {
+                          ui.post {
+                              cursor?.visibility = View.VISIBLE
+                              cursor?.invalidate()
+                          }
+                      }
+                      while (true) {
+                          val line = r.readLine() ?: break
+                          exec(line)
+                      }
+                  } catch (e: Exception) {
+                  } finally {
+                      if (counted && clients.decrementAndGet() <= 0) {
+                          ui.post { cursor?.visibility = View.GONE }
+                      }
+                      try {
+                          s.close()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun exec(line: String) {
+                  val p = line.trim().split(' ')
+                  when (p[0]) {
+                      "M" -> if (p.size >= 3) {
+                          val dx = p[1].toFloatOrNull() ?: 0f
+                          val dy = p[2].toFloatOrNull() ?: 0f
+                          ui.post { move(dx, dy) }
+                      }
+                      "T" -> ui.post {
+                          tap(70L)
+                          cursor?.flash()
+                      }
+                      "L" -> ui.post {
+                          tap(800L)
+                          cursor?.flash()
+                      }
+                      "W" -> if (p.size >= 3) {
+                          val dx = p[1].toFloatOrNull() ?: 0f
+                          val dy = p[2].toFloatOrNull() ?: 0f
+                          ui.post {
+                              scrollDx += dx
+                              scrollDy += dy
+                              if (!scrollPending) {
+                                  scrollPending = true
+                                  ui.postDelayed(flushScroll, 100L)
+                              }
+                          }
+                      }
+                      "P" -> ui.post { page(p.getOrNull(1) == "up") }
+                      "K" -> ui.post { key(p.getOrNull(1) ?: "") }
+                  }
+              }
+
+              private fun move(dx: Float, dy: Float) {
+                  cx = (cx + dx).coerceIn(0f, sw - 1f)
+                  cy = (cy + dy).coerceIn(0f, sh - 1f)
+                  cursor?.setPos(cx, cy)
+              }
+
+              private fun gesture(path: Path, dur: Long) {
+                  try {
+                      val g = GestureDescription.Builder()
+                          .addStroke(GestureDescription.StrokeDescription(path, 0L, dur.coerceAtLeast(1L)))
+                          .build()
+                      dispatchGesture(g, null, null)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun tap(dur: Long) {
+                  val path = Path()
+                  path.moveTo(cx, cy)
+                  gesture(path, dur)
+              }
+
+              /** Desliza un "dedo" (vx, vy) desde el puntero, ajustando el inicio para no salirse de la pantalla. */
+              private fun swipe(vxIn: Float, vyIn: Float, dur: Long) {
+                  val maxLen = 0.6f * minOf(sw, sh)
+                  val len = hypot(vxIn, vyIn)
+                  var vx = vxIn
+                  var vy = vyIn
+                  if (len > maxLen) {
+                      val k = maxLen / len
+                      vx *= k
+                      vy *= k
+                  }
+                  val sx = cx.coerceIn(maxOf(0f, -vx), minOf(sw - 1f, sw - 1f - vx))
+                  val sy = cy.coerceIn(maxOf(0f, -vy), minOf(sh - 1f, sh - 1f - vy))
+                  val path = Path()
+                  path.moveTo(sx, sy)
+                  path.lineTo(sx + vx, sy + vy)
+                  gesture(path, dur)
+              }
+
+              private val flushScroll = Runnable {
+                  scrollPending = false
+                  val dx = scrollDx
+                  val dy = scrollDy
+                  scrollDx = 0f
+                  scrollDy = 0f
+                  if (abs(dx) + abs(dy) >= 6f) swipe(dx * SCROLL_GAIN, dy * SCROLL_GAIN, 120L)
+              }
+
+              private fun page(up: Boolean) {
+                  val vy = 0.55f * sh
+                  swipe(0f, if (up) vy else -vy, 350L)
+              }
+
+              private fun key(name: String) {
+                  when (name) {
+                      "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                      "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+                      "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                  }
+              }
+
+              private fun cleanup() {
+                  running = false
+                  try {
+                      server?.close()
+                  } catch (e: Exception) {
+                  }
+                  server = null
+                  val v = cursor
+                  if (v != null) {
+                      try {
+                          wm?.removeView(v)
+                      } catch (e: Exception) {
+                      }
+                  }
+                  cursor = null
+                  ui.removeCallbacks(flushScroll)
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  cleanup()
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  cleanup()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  private const val SCROLL_GAIN = 2.5f
+              }
+          }
+
+          /** El puntero: una flecha blanca con borde negro y un anillo azul al hacer clic. */
+          private class CursorView(ctx: Context) : View(ctx) {
+              private var px = 0f
+              private var py = 0f
+              private var flashUntil = 0L
+              private val sc = ctx.resources.displayMetrics.density
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  style = Paint.Style.FILL
+              }
+              private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.BLACK
+                  style = Paint.Style.STROKE
+                  strokeWidth = 2.2f * sc
+                  strokeJoin = Paint.Join.ROUND
+              }
+              private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 3f * sc
+                  color = Color.rgb(59, 130, 246)
+              }
+              private val path = Path()
+
+              fun setPos(x: Float, y: Float) {
+                  px = x
+                  py = y
+                  invalidate()
+              }
+
+              fun flash() {
+                  flashUntil = SystemClock.uptimeMillis() + 280L
+                  invalidate()
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val s = 2.2f * sc
+                  path.reset()
+                  path.moveTo(px, py)
+                  path.lineTo(px, py + 20f * s)
+                  path.lineTo(px + 5f * s, py + 15f * s)
+                  path.lineTo(px + 9f * s, py + 23f * s)
+                  path.lineTo(px + 12f * s, py + 21.5f * s)
+                  path.lineTo(px + 8f * s, py + 14f * s)
+                  path.lineTo(px + 14.5f * s, py + 14f * s)
+                  path.close()
+                  val left = flashUntil - SystemClock.uptimeMillis()
+                  if (left > 0L) {
+                      val f = left / 280f
+                      ring.alpha = (255 * f).toInt().coerceIn(0, 255)
+                      c.drawCircle(px, py, (1f - f) * 26f * sc + 6f * sc, ring)
+                      postInvalidateOnAnimation()
+                  }
+                  c.drawPath(path, fill)
+                  c.drawPath(path, edge)
+              }
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
           cat > app/src/main/java/com/tvcontrol/RemoteScreen.kt <<'TVEOF'
           package com.tvcontrol
 
@@ -1132,39 +1968,24 @@ jobs:
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.Image
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.border
-          import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.gestures.awaitEachGesture
-          import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
-          import androidx.compose.foundation.shape.CircleShape
-          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
-          import androidx.compose.ui.draw.clip
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.asImageBitmap
-          import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.platform.LocalContext
-          import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.Dp
           import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-          import kotlinx.coroutines.Job
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withTimeoutOrNull
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
-          import kotlin.math.abs
-          import kotlin.math.hypot
-          import kotlin.math.roundToInt
 
           private const val REC_PATH = "/sdcard/tvrec.mp4"
 
@@ -1179,7 +2000,6 @@ jobs:
               var recording by remember { mutableStateOf(false) }
               var busy by remember { mutableStateOf(false) }
               var small by remember { mutableStateOf(true) }
-              var mouseMode by remember { mutableStateOf(true) }
 
               LaunchedEffect(Unit) {
                   recording = try { Adb.shell("pidof screenrecord").trim().isNotEmpty() } catch (e: Throwable) { false }
@@ -1244,34 +2064,25 @@ jobs:
                   Btn3D(label, { key(code) }, Modifier.width(w), color = color, wide = true)
 
               Column(
-                  Modifier.fillMaxSize().verticalScroll(rememberScrollState(), enabled = !mouseMode).padding(12.dp),
+                  Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
                   horizontalAlignment = Alignment.CenterHorizontally,
                   verticalArrangement = Arrangement.spacedBy(6.dp)
               ) {
+                  // D-pad
+                  K("▲", 19)
+                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) { K("◀", 21); K("OK", 23, TvGreen); K("▶", 22) }
+                  K("▼", 20)
                   Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                      Btn3D("🎮 Botones", { mouseMode = false }, color = if (!mouseMode) TvBlue else TvSlate, small = true)
-                      Btn3D("🖱 Ratón", { mouseMode = true }, color = if (mouseMode) TvBlue else TvSlate, small = true)
+                      K("Atrás", 4, TvSlate); K("Inicio", 3, TvSlate); K("Menú", 82, TvSlate)
                   }
-                  if (mouseMode) {
-                      MousePad(
-                          onMsg = { msg = it },
-                          onNavKey = { code -> key(code) }
-                      )
-                  } else {
-                      K("▲", 19)
-                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) { K("◀", 21); K("OK", 23, TvGreen); K("▶", 22) }
-                      K("▼", 20)
-                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                          K("Atrás", 4, TvSlate); K("Inicio", 3, TvSlate); K("Menú", 82, TvSlate)
-                      }
-                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                          K("Vol −", 25, TvPurple); K("Mute", 164, TvPurple); K("Vol +", 24, TvPurple)
-                      }
-                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                          K("⏮", 88, TvAmber); K("⏯", 85, TvAmber); K("⏭", 87, TvAmber)
-                      }
+                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                      K("Vol −", 25, TvPurple); K("Mute", 164, TvPurple); K("Vol +", 24, TvPurple)
+                  }
+                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                      K("⏮", 88, TvAmber); K("⏯", 85, TvAmber); K("⏭", 87, TvAmber)
                   }
 
+                  // Texto desde el teléfono
                   Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       OutlinedTextField(text, { text = it }, label = { Text("Texto para la TV") },
                           singleLine = true, modifier = Modifier.weight(1f))
@@ -1289,6 +2100,7 @@ jobs:
 
                   HorizontalDivider(Modifier.padding(vertical = 6.dp))
 
+                  // Captura y grabación
                   Btn3D("📸 Captura de pantalla", {
                       scope.launch {
                           msg = "Capturando…"
@@ -1318,6 +2130,7 @@ jobs:
 
                   HorizontalDivider(Modifier.padding(vertical = 6.dp))
 
+                  // Energía
                   Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                       Btn3D("Encender/Apagar", { key(26) }, color = TvAmber)
                       Btn3D("Reiniciar", { confirmReboot = true }, color = TvRed)
@@ -1339,420 +2152,450 @@ jobs:
                   )
               }
           }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/Scan.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.asCoroutineDispatcher
+          import kotlinx.coroutines.coroutineScope
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withTimeoutOrNull
+          import java.net.ConnectException
+          import java.net.Inet4Address
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.net.NetworkInterface
+          import java.net.Socket
+          import java.util.Collections
+          import java.util.concurrent.ConcurrentHashMap
+          import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicInteger
+
+          data class Dev(val ip: String, val name: String?, val ports: Set<Int>, val me: Boolean)
+
+          class Kind(val icon: String, val label: String)
+
+          object Net {
+              /** Puertos que se sondean para reconocer qué es cada aparato. */
+              val PORTS = intArrayOf(5555, 8008, 8009, 80, 443, 8080, 554, 22, 445, 9100, 631, 7000, 8060, 53)
+
+              /** IP del teléfono en la red wifi (prefiere wlan). */
+              fun localIp(): String? {
+                  var best: String? = null
+                  val ifaces = try {
+                      Collections.list(NetworkInterface.getNetworkInterfaces())
+                  } catch (e: Exception) {
+                      return null
+                  }
+                  for (ni in ifaces) {
+                      try {
+                          if (!ni.isUp || ni.isLoopback) continue
+                          for (ia in Collections.list(ni.inetAddresses)) {
+                              if (ia is Inet4Address && ia.isSiteLocalAddress) {
+                                  if (ni.name.startsWith("wlan")) return ia.hostAddress
+                                  if (best == null) best = ia.hostAddress
+                              }
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }
+                  return best
+              }
+
+              fun ipKey(ip: String): Int = ip.substringAfterLast('.').toIntOrNull() ?: 0
+
+              fun kindOf(d: Dev): Kind {
+                  val p = d.ports
+                  val web = 80 in p || 443 in p || 8080 in p
+                  return when {
+                      d.me -> Kind("📱", "Este teléfono")
+                      5555 in p -> Kind("📺", "Android / TV · ADB activo")
+                      8009 in p || 8008 in p -> Kind("📡", "Chromecast / Google TV")
+                      8060 in p -> Kind("📺", "Roku")
+                      9100 in p || 631 in p -> Kind("🖨", "Impresora")
+                      554 in p -> Kind("📷", "Cámara / DVR")
+                      (53 in p && web) || (d.ip.endsWith(".1") && web) -> Kind("🌐", "Router")
+                      7000 in p -> Kind("🍎", "Dispositivo Apple")
+                      445 in p -> Kind("🖥", "PC / NAS")
+                      22 in p -> Kind("🖥", "Servidor SSH")
+                      web -> Kind("🌐", "Dispositivo con web")
+                      else -> Kind("📱", "Dispositivo en la red")
+                  }
+              }
+
+              fun servicesOf(d: Dev): String {
+                  val out = LinkedHashSet<String>()
+                  for (p in d.ports.sorted()) {
+                      when (p) {
+                          5555 -> out += "ADB"
+                          8008, 8009 -> out += "Cast"
+                          80, 443, 8080 -> out += "Web"
+                          554 -> out += "RTSP"
+                          22 -> out += "SSH"
+                          445 -> out += "SMB"
+                          9100, 631 -> out += "Impresión"
+                          7000 -> out += "AirPlay"
+                          8060 -> out += "Roku"
+                          53 -> out += "DNS"
+                      }
+                  }
+                  return out.joinToString(" · ")
+              }
+          }
+
+          /**
+           * Busca aparatos en la red local sin permisos especiales: prueba conectarse por TCP
+           * a varios puertos de cada IP del /24. Un equipo que acepta la conexión, o que la
+           * rechaza (puerto cerrado), está encendido y conectado.
+           */
+          class Scanner {
+              private val ports = ConcurrentHashMap<String, MutableSet<Int>>()
+              private val alive = ConcurrentHashMap.newKeySet<String>()
+              private val names = ConcurrentHashMap<String, String>()
+              private val done = AtomicInteger(0)
+
+              @Volatile
+              private var total = 1
+
+              val progress: Float get() = (done.get().toFloat() / total).coerceIn(0f, 1f)
+
+              fun snapshot(me: String?): List<Dev> = alive.toList().map { ip ->
+                  Dev(ip, names[ip], (ports[ip] ?: emptySet<Int>()).toSet(), ip == me)
+              }
+
+              private fun probe(ip: String, port: Int) {
+                  val s = Socket()
+                  try {
+                      s.connect(InetSocketAddress(ip, port), 450)
+                      alive.add(ip)
+                      ports.computeIfAbsent(ip) { ConcurrentHashMap.newKeySet<Int>() }.add(port)
+                  } catch (e: ConnectException) {
+                      // rechazado: el equipo existe pero ese puerto está cerrado
+                      if ((e.message ?: "").contains("refused", ignoreCase = true)) alive.add(ip)
+                  } catch (e: Exception) {
+                  } finally {
+                      try {
+                          s.close()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              suspend fun run(prefix: String) {
+                  val pool = Executors.newFixedThreadPool(256)
+                  val disp = pool.asCoroutineDispatcher()
+                  try {
+                      total = 254 * Net.PORTS.size
+                      coroutineScope {
+                          for (n in 1..254) {
+                              for (p in Net.PORTS) {
+                                  launch(disp) {
+                                      probe("$prefix.$n", p)
+                                      done.incrementAndGet()
+                                  }
+                              }
+                          }
+                      }
+                      // nombres de los equipos encontrados (si el router los informa)
+                      coroutineScope {
+                          for (ip in alive.toList()) {
+                              launch(disp) {
+                                  val n = withTimeoutOrNull(1500L) {
+                                      async(disp) {
+                                          try {
+                                              InetAddress.getByName(ip).canonicalHostName
+                                          } catch (e: Exception) {
+                                              null
+                                          }
+                                      }.await()
+                                  }
+                                  if (n != null && n != ip && !n.all { it.isDigit() || it == '.' }) names[ip] = n
+                              }
+                          }
+                      }
+                  } finally {
+                      disp.close()
+                  }
+              }
+          }
+          TVEOF
+          mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/TouchpadScreen.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.gestures.awaitEachGesture
+          import androidx.compose.foundation.gestures.awaitFirstDown
+          import androidx.compose.foundation.gestures.detectVerticalDragGestures
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Path
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+          import androidx.compose.ui.input.pointer.PointerEvent
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.input.pointer.positionChanged
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalHapticFeedback
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlin.math.abs
 
           @Composable
-          fun MousePad(
-              onMsg: (String) -> Unit,
-              onNavKey: (Int) -> Unit
-          ) {
+          fun TouchpadScreen() {
               val ctx = LocalContext.current
               val scope = rememberCoroutineScope()
-              var tvW by remember { mutableIntStateOf(1920) }
-              var tvH by remember { mutableIntStateOf(1080) }
-              var cx by remember { mutableFloatStateOf(0.5f) }
-              var cy by remember { mutableFloatStateOf(0.5f) }
-              var speed by remember { mutableFloatStateOf(1.6f) }
-              var invert by remember { mutableStateOf(false) }
-              var acc by remember { mutableFloatStateOf(0f) }
-              var pointerReady by remember { mutableStateOf(false) }
-              var overlayOk by remember { mutableStateOf(false) }
-              var activePort by remember { mutableIntStateOf(15556) }
-              var ptrOut by remember { mutableStateOf<java.io.PrintWriter?>(null) }
-              var ptrSock by remember { mutableStateOf<java.net.Socket?>(null) }
-              var lastMoveSent by remember { mutableLongStateOf(0L) }
-              var lastFallbackMove by remember { mutableLongStateOf(0L) }
-              var scrollJob by remember { mutableStateOf<Job?>(null) }
-              var hasInputMouseMove by remember { mutableStateOf<Boolean?>(null) }
+              var session by remember { mutableStateOf<PointerSession?>(null) }
+              var status by remember { mutableStateOf("Preparando el puntero…") }
+              var error by remember { mutableStateOf("") }
+              var busy by remember { mutableStateOf(false) }
+              var speed by remember { mutableFloatStateOf(2.5f) }
 
-              fun closePtrSocket() {
-                  runCatching { ptrOut?.println("H"); ptrOut?.flush() }
-                  runCatching { ptrOut?.close() }
-                  runCatching { ptrSock?.close() }
-                  ptrOut = null
-                  ptrSock = null
-                  pointerReady = false
-                  overlayOk = false
-              }
-
-              suspend fun tryConnectAnyPort(host: String): Int? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                  for (port in 15556..15565) {
+              fun start() {
+                  if (busy) return
+                  busy = true
+                  error = ""
+                  scope.launch {
                       try {
-                          val s = java.net.Socket()
-                          s.tcpNoDelay = true
-                          s.connect(java.net.InetSocketAddress(host, port), 500)
-                          val pw = java.io.PrintWriter(java.io.BufferedWriter(java.io.OutputStreamWriter(s.getOutputStream())), true)
-                          pw.println("PING")
-                          s.soTimeout = 500
-                          val resp = java.io.BufferedReader(java.io.InputStreamReader(s.getInputStream())).readLine()
-                          if (resp != null && resp.startsWith("PONG")) {
-                              s.soTimeout = 0
-                              ptrSock = s
-                              ptrOut = pw
-                              overlayOk = resp.contains("OVL=1")
-                              return@withContext port
-                          } else {
-                              s.close()
-                          }
-                      } catch (_: Throwable) { }
-                  }
-                  null
-              }
-
-              LaunchedEffect(Unit) {
-                  try {
-                      val out = Adb.shell("wm size")
-                      val m = Regex("""(\d+)x(\d+)""").findAll(out).lastOrNull()
-                      if (m != null) {
-                          tvW = m.groupValues[1].toInt()
-                          tvH = m.groupValues[2].toInt()
+                          session = PointerSetup.open(ctx, Adb.currentHost) { status = it }
+                          status = "Puntero activo en la TV"
+                      } catch (e: Throwable) {
+                          error = e.message ?: "Error desconocido"
+                          status = "No se pudo activar el puntero"
                       }
-                      val h = Adb.host
-                      if (h.isNotEmpty()) {
-                          val existing = tryConnectAnyPort(h)
-                          if (existing != null) {
-                              activePort = existing
-                              pointerReady = true
-                          } else {
-                              val dexLocal = java.io.File(ctx.cacheDir, "tvptr.dex")
-                              ctx.assets.open("tvptr.dex").use { inp ->
-                                  dexLocal.outputStream().use { outStr -> inp.copyTo(outStr) }
-                              }
-                              Adb.push(dexLocal, "/data/local/tmp/tvptr.dex")
-                              kotlinx.coroutines.withTimeoutOrNull(3000) {
-                                  Adb.shell("nohup env CLASSPATH=/data/local/tmp/tvptr.dex app_process / TvPointer >/data/local/tmp/tvptr.log 2>&1 </dev/null &")
-                              }
-                              repeat(12) {
-                                  if (!pointerReady) {
-                                      delay(250)
-                                      val foundPort = tryConnectAnyPort(h)
-                                      if (foundPort != null) {
-                                          activePort = foundPort
-                                          pointerReady = true
-                                      }
-                                  }
-                              }
-                          }
-                      }
-                      if (pointerReady) {
-                          kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                              ptrOut?.println("M ${tvW / 2} ${tvH / 2}")
-                          }
-                      } else {
-                          val helpOut = runCatching { Adb.shell("input --help 2>&1") }.getOrDefault("")
-                          hasInputMouseMove = helpOut.contains("mouse")
-                      }
-                  } catch (_: Throwable) { }
-              }
-
-              DisposableEffect(Unit) {
-                  onDispose {
-                      scope.launch(kotlinx.coroutines.Dispatchers.IO) { closePtrSocket() }
+                      busy = false
                   }
               }
 
-              fun px() = (cx * tvW).roundToInt().coerceIn(0, tvW - 1)
-              fun py() = (cy * tvH).roundToInt().coerceIn(0, tvH - 1)
-
-              fun sendPtr(line: String, fallbackCmd: String? = null) {
-                  scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                      val pw = ptrOut
-                      if (pointerReady && pw != null) {
-                          try {
-                              pw.println(line)
-                              if (!pw.checkError()) return@launch
-                          } catch (_: Throwable) { }
-                          pointerReady = false
-                      }
-                      if (fallbackCmd != null) {
-                          try { Adb.shell(fallbackCmd) } catch (e: Throwable) { onMsg("Error: ${e.message}") }
+              LaunchedEffect(Unit) { start() }
+              DisposableEffect(Unit) { onDispose { session?.close() } }
+              // Si la conexión con el puntero se cae, se avisa y se ofrece reintentar.
+              LaunchedEffect(session) {
+                  while (session != null) {
+                      delay(1000)
+                      if (session?.alive == false) {
+                          session?.close()
+                          session = null
+                          status = "Puntero desconectado"
                       }
                   }
               }
 
-              fun moveCursor(x: Int, y: Int) {
-                  val now = System.currentTimeMillis()
-                  if (pointerReady && ptrOut != null) {
-                      if (now - lastMoveSent < 16L) return
-                      lastMoveSent = now
-                      sendPtr("M $x $y")
-                  } else if (hasInputMouseMove == true) {
-                      if (now - lastFallbackMove < 90L) return
-                      lastFallbackMove = now
-                      sendPtr("M $x $y", "input mouse move $x $y")
-                  }
-              }
-
-              fun tap() {
-                  val x = px()
-                  val y = py()
-                  val fb = if (hasInputMouseMove == true) "input mouse tap $x $y" else "input tap $x $y"
-                  sendPtr("C $x $y", fb)
-              }
-
-              fun longTap() {
-                  val x = px()
-                  val y = py()
-                  sendPtr("L $x $y", "input swipe $x $y $x $y 700")
-              }
-
-              fun rightClickOrBack() {
-                  onNavKey(4)
-              }
-
-              fun scrollWheel(dir: Int) {
-                  val x = px()
-                  val y = py()
-                  val vDelta = if (dir > 0) -3.0f else 3.0f
-                  val d = (tvH * 0.16f).toInt()
-                  val yStart = (y + dir * d / 2).coerceIn(60, tvH - 60)
-                  val yEnd = (y - dir * d / 2).coerceIn(60, tvH - 60)
-                  sendPtr("S $x $y $vDelta", "input swipe $x $yStart $x $yEnd 220")
-              }
-
-              fun scrollSwipe(dir: Int) {
-                  if (scrollJob?.isActive == true) return
-                  scrollJob = scope.launch {
-                      try {
-                          val x = px()
-                          val d = (tvH * 0.25f).toInt()
-                          val yStart = (tvH / 2 + dir * d / 2).coerceIn(80, tvH - 80)
-                          val yEnd = (tvH / 2 - dir * d / 2).coerceIn(80, tvH - 80)
-                          Adb.shell("input swipe $x $yStart $x $yEnd 380")
-                      } catch (e: Throwable) { onMsg("Error: ${e.message}") }
-                      delay(150)
-                  }
-              }
-
-              @Composable
-              fun QuickIconBtn(label: String, modifier: Modifier = Modifier, tint: Color = Color(0xFFE2E8F0), onClick: () -> Unit) {
-                  Box(
-                      modifier
-                          .height(44.dp)
-                          .clip(RoundedCornerShape(10.dp))
-                          .background(Color(0xFF282A36))
-                          .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
-                          .clickable(onClick = onClick),
-                      contentAlignment = Alignment.Center
-                  ) {
-                      Text(label, color = tint, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                  }
-              }
-
-              Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                      QuickIconBtn("🔇", Modifier.weight(1f)) { onNavKey(164) }
-                      QuickIconBtn("🔉", Modifier.weight(1f)) { onNavKey(25) }
-                      QuickIconBtn("🔊", Modifier.weight(1f)) { onNavKey(24) }
-                      QuickIconBtn("⏮", Modifier.weight(1f)) { onNavKey(88) }
-                      QuickIconBtn("⏯", Modifier.weight(1f)) { onNavKey(85) }
-                      QuickIconBtn("⏭", Modifier.weight(1f)) { onNavKey(87) }
-                      QuickIconBtn("⏻", Modifier.weight(1f), tint = TvRed) { onNavKey(26) }
-                  }
-
-                  BoxWithConstraints(Modifier.fillMaxWidth()) {
-                      val stripW = 48.dp
-                      val padW = maxWidth - stripW - 8.dp
-                      val padH = 310.dp
-                      val shape = RoundedCornerShape(16.dp)
-
-                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                          Box(
-                              Modifier
-                                  .width(padW)
-                                  .height(padH)
-                                  .clip(shape)
-                                  .background(Color(0xFF3A3D4A))
-                                  .border(1.dp, Color.White.copy(alpha = 0.12f), shape)
-                                  .pointerInput(speed) {
-                                      awaitEachGesture {
-                                          val down = awaitFirstDown(requireUnconsumed = false)
-                                          down.consume()
-                                          var totalDist = 0f
-                                          var lastPos = down.position
-                                          val downTime = System.currentTimeMillis()
-                                          var longTriggered = false
-
-                                          while (true) {
-                                              val event = awaitPointerEvent()
-                                              val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                                              if (!change.pressed) {
-                                                  change.consume()
-                                                  break
-                                              }
-                                              val delta = change.position - lastPos
-                                              lastPos = change.position
-                                              totalDist += hypot(delta.x, delta.y)
-                                              change.consume()
-
-                                              if (delta.x != 0f || delta.y != 0f) {
-                                                  cx = (cx + delta.x * speed / size.width).coerceIn(0f, 1f)
-                                                  cy = (cy + delta.y * speed / size.height).coerceIn(0f, 1f)
-                                                  moveCursor(px(), py())
-                                              }
-                                              if (!longTriggered && totalDist < 12f && System.currentTimeMillis() - downTime > 650) {
-                                                  longTriggered = true
-                                                  longTap()
-                                              }
-                                          }
-
-                                          if (!longTriggered && totalDist < 12f) {
-                                              tap()
-                                          }
-                                      }
-                                  }
-                          ) {
-                              val statusLabel = when {
-                                  pointerReady && overlayOk -> "Puntero :$activePort (${px()}, ${py()})"
-                                  pointerReady -> "Hover :$activePort sin flecha (${px()}, ${py()})"
-                                  hasInputMouseMove == true -> "Modo ratón ADB (${px()}, ${py()})"
-                                  else -> "Modo toque (${px()}, ${py()})"
-                              }
-                              Text(
-                                  statusLabel,
-                                  Modifier.align(Alignment.Center),
-                                  fontSize = 13.sp,
-                                  fontWeight = FontWeight.Medium,
-                                  color = Color.White.copy(alpha = 0.55f)
-                              )
-                              Box(
-                                  Modifier
-                                      .align(Alignment.BottomStart)
-                                      .padding(12.dp)
-                                      .size(34.dp)
-                                      .clip(RoundedCornerShape(8.dp))
-                                      .background(Color.White.copy(alpha = 0.08f)),
-                                  contentAlignment = Alignment.Center
-                              ) {
-                                  Text("🖱", fontSize = 18.sp)
-                              }
-                              Box(
-                                  Modifier
-                                      .offset(
-                                          x = (padW - 18.dp) * cx,
-                                          y = (padH - 18.dp) * cy
-                                      )
-                                      .size(18.dp)
-                                      .background(if (pointerReady) TvGreen else TvAmber, CircleShape)
-                                      .border(2.dp, Color.White, CircleShape)
-                              )
-                          }
-
-                          Column(
-                              Modifier
-                                  .width(stripW)
-                                  .height(padH)
-                                  .clip(shape)
-                                  .background(Color(0xFF282A36))
-                                  .border(1.dp, Color.White.copy(alpha = 0.08f), shape),
-                              horizontalAlignment = Alignment.CenterHorizontally,
-                              verticalArrangement = Arrangement.SpaceBetween
-                          ) {
-                              Box(
-                                  Modifier.fillMaxWidth().height(44.dp).clickable { scrollWheel(-1) },
-                                  contentAlignment = Alignment.Center
-                              ) { Text("⌃", fontSize = 18.sp, color = Color.White.copy(alpha = 0.8f)) }
-
-                              Box(
-                                  Modifier
-                                      .fillMaxWidth()
-                                      .weight(1f)
-                                      .pointerInput(invert) {
-                                          val step = 28.dp.toPx()
-                                          awaitEachGesture {
-                                              val down = awaitFirstDown(requireUnconsumed = false)
-                                              down.consume()
-                                              acc = 0f
-                                              var lastY = down.position.y
-                                              while (true) {
-                                                  val event = awaitPointerEvent()
-                                                  val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                                                  if (!change.pressed) {
-                                                      change.consume()
-                                                      break
-                                                  }
-                                                  val dy = change.position.y - lastY
-                                                  lastY = change.position.y
-                                                  change.consume()
-                                                  acc += dy
-                                                  if (abs(acc) >= step) {
-                                                      val rawDir = if (acc > 0f) 1 else -1
-                                                      acc = 0f
-                                                      val dir = if (invert) -rawDir else rawDir
-                                                      scrollWheel(dir)
-                                                  }
-                                              }
-                                          }
-                                      },
-                                  contentAlignment = Alignment.Center
-                              ) {
-                                  Box(
-                                      Modifier
-                                          .width(4.dp)
-                                          .fillMaxHeight(0.75f)
-                                          .background(Color.White.copy(alpha = 0.25f), CircleShape)
-                                  )
-                              }
-
-                              Box(
-                                  Modifier.fillMaxWidth().height(44.dp).clickable { scrollWheel(1) },
-                                  contentAlignment = Alignment.Center
-                              ) { Text("⌄", fontSize = 18.sp, color = Color.White.copy(alpha = 0.8f)) }
-                          }
-                      }
-                  }
-
-                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                      Box(
-                          Modifier
-                              .weight(1f)
-                              .height(48.dp)
-                              .clip(RoundedCornerShape(10.dp))
-                              .background(Color(0xFF3A3D4A))
-                              .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(10.dp))
-                              .clickable { tap() },
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text("Clic", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                      }
-                      Box(
-                          Modifier
-                              .weight(1f)
-                              .height(48.dp)
-                              .clip(RoundedCornerShape(10.dp))
-                              .background(Color(0xFF3A3D4A))
-                              .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(10.dp))
-                              .clickable { scrollSwipe(1) },
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text("Deslizar ↓", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                      }
-                      Box(
-                          Modifier
-                              .weight(1f)
-                              .height(48.dp)
-                              .clip(RoundedCornerShape(10.dp))
-                              .background(Color(0xFF3A3D4A))
-                              .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(10.dp))
-                              .clickable { rightClickOrBack() },
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text("Atrás", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                      }
-                  }
-
-                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                      QuickIconBtn("⋮", Modifier.weight(1f)) { onNavKey(82) }
-                      QuickIconBtn("💬", Modifier.weight(1f)) { onNavKey(187) }
-                      QuickIconBtn("☰", Modifier.weight(1f)) { onNavKey(82) }
-                      QuickIconBtn("🏠", Modifier.weight(1f)) { onNavKey(3) }
-                      QuickIconBtn("‹", Modifier.weight(1f)) { onNavKey(4) }
-                  }
-
-                  Text("Velocidad del puntero", style = MaterialTheme.typography.bodySmall)
-                  Slider(speed, { speed = it }, modifier = Modifier.fillMaxWidth(), valueRange = 0.8f..4f)
+              Column(
+                  Modifier.fillMaxSize().padding(12.dp),
+                  verticalArrangement = Arrangement.spacedBy(6.dp)
+              ) {
                   Row(verticalAlignment = Alignment.CenterVertically) {
-                      Checkbox(invert, { invert = it })
-                      Text("Invertir dirección del scroll", style = MaterialTheme.typography.bodySmall)
+                      Text(
+                          status, Modifier.weight(1f),
+                          style = MaterialTheme.typography.titleSmall,
+                          color = if (session != null) TvGreen else MaterialTheme.colorScheme.onSurface
+                      )
+                      if (session == null) {
+                          Btn3D(if (busy) "…" else "Reintentar", { start() }, enabled = !busy, small = true)
+                      }
+                  }
+                  if (error.isNotEmpty()) {
+                      Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                  }
+
+                  Row(
+                      Modifier.weight(1f).fillMaxWidth(),
+                      horizontalArrangement = Arrangement.spacedBy(10.dp)
+                  ) {
+                      Pad(Modifier.weight(1f).fillMaxHeight(), session, speed)
+                      ScrollStrip(Modifier.width(60.dp).fillMaxHeight(), session)
+                  }
+
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Text("Velocidad", fontSize = 12.sp)
+                      Slider(
+                          value = speed, onValueChange = { speed = it },
+                          valueRange = 1f..6f, modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                      )
+                  }
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Btn3D("◀ Atrás", { session?.send("K back") }, color = TvSlate, small = true)
+                      Btn3D("🏠 Inicio", { session?.send("K home") }, color = TvSlate, small = true)
+                      Btn3D("▤ Recientes", { session?.send("K recents") }, color = TvSlate, small = true)
+                  }
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Btn3D("⬆ Subir pág.", { session?.send("P up") }, color = TvPurple, small = true)
+                      Btn3D("⬇ Bajar pág.", { session?.send("P down") }, color = TvPurple, small = true)
+                      Btn3D("Clic", { session?.send("T") }, color = TvBlue, small = true)
+                  }
+                  TextButton(onClick = {
+                      scope.launch {
+                          session?.close()
+                          session = null
+                          PointerSetup.disable()
+                          status = "Puntero desactivado en la TV"
+                      }
+                  }) { Text("Quitar el puntero de la TV", fontSize = 12.sp) }
+              }
+          }
+
+          @Composable
+          private fun Pad(modifier: Modifier, session: PointerSession?, speed: Float) {
+              val shape = RoundedCornerShape(22.dp)
+              val haptic = LocalHapticFeedback.current
+              var redraw by remember { mutableIntStateOf(0) }
+              val sess by rememberUpdatedState(session)
+              val spd by rememberUpdatedState(speed)
+
+              Box(
+                  modifier
+                      .background(Brush.verticalGradient(listOf(Color(0xFF1B2A4A), Color(0xFF0F172A))), shape)
+                      .border(1.5.dp, TvBlue.copy(alpha = 0.55f), shape)
+                      .pointerInput(Unit) {
+                          awaitEachGesture {
+                              val down = awaitFirstDown(requireUnconsumed = false)
+                              val slop = viewConfiguration.touchSlop
+                              val t0 = down.uptimeMillis
+                              var lastT = t0
+                              var prevX = down.position.x
+                              var prevY = down.position.y
+                              var lastCount = 1
+                              var moved = 0f
+                              var maxPtr = 1
+                              var longDone = false
+                              while (true) {
+                                  val ev: PointerEvent? =
+                                      if (!longDone && maxPtr == 1 && moved < slop) {
+                                          withTimeoutOrNull(450L) { awaitPointerEvent() }
+                                      } else {
+                                          awaitPointerEvent()
+                                      }
+                                  if (ev == null) {
+                                      // se mantuvo apretado sin moverse: clic largo
+                                      longDone = true
+                                      sess?.send("L")
+                                      haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                      continue
+                                  }
+                                  val pressed = ev.changes.filter { it.pressed }
+                                  if (pressed.isEmpty()) {
+                                      lastT = ev.changes.firstOrNull()?.uptimeMillis ?: lastT
+                                      break
+                                  }
+                                  lastT = ev.changes[0].uptimeMillis
+                                  maxPtr = maxOf(maxPtr, pressed.size)
+                                  val cxp = pressed.map { it.position.x }.average().toFloat()
+                                  val cyp = pressed.map { it.position.y }.average().toFloat()
+                                  if (pressed.size != lastCount) {
+                                      // cambió la cantidad de dedos: el centro "salta", se ignora ese tramo
+                                      lastCount = pressed.size
+                                      prevX = cxp
+                                      prevY = cyp
+                                      ev.changes.forEach { it.consume() }
+                                      continue
+                                  }
+                                  val dx = cxp - prevX
+                                  val dy = cyp - prevY
+                                  prevX = cxp
+                                  prevY = cyp
+                                  moved += abs(dx) + abs(dy)
+                                  val s = sess
+                                  if (s != null && !longDone) {
+                                      if (pressed.size >= 2) {
+                                          if (moved >= 4f) s.send("W $dx $dy")
+                                      } else if (maxPtr == 1 && moved >= slop) {
+                                          s.move(dx * spd, dy * spd)
+                                          redraw++
+                                      }
+                                  }
+                                  ev.changes.forEach { if (it.positionChanged()) it.consume() }
+                              }
+                              // al soltar: un toque corto y quieto es un clic
+                              if (!longDone && maxPtr == 1 && moved < 20f && lastT - t0 < 400L) {
+                                  sess?.send("T")
+                              }
+                          }
+                      }
+              ) {
+                  Canvas(Modifier.fillMaxSize()) {
+                      // Cuadrícula suave
+                      val step = 48.dp.toPx()
+                      var gx = step
+                      while (gx < size.width) {
+                          drawLine(Color.White.copy(alpha = 0.04f), Offset(gx, 0f), Offset(gx, size.height), 1f)
+                          gx += step
+                      }
+                      var gy = step
+                      while (gy < size.height) {
+                          drawLine(Color.White.copy(alpha = 0.04f), Offset(0f, gy), Offset(size.width, gy), 1f)
+                          gy += step
+                      }
+                      // Puntero: el pad es un mapa de la pantalla de la TV
+                      @Suppress("UNUSED_VARIABLE")
+                      val tick = redraw
+                      val s = sess
+                      if (s != null) {
+                          val px = s.x / s.w * size.width
+                          val py = s.y / s.h * size.height
+                          val k = 1.4f * density
+                          val arrow = Path().apply {
+                              moveTo(px, py)
+                              lineTo(px, py + 20f * k)
+                              lineTo(px + 5f * k, py + 15f * k)
+                              lineTo(px + 9f * k, py + 23f * k)
+                              lineTo(px + 12f * k, py + 21.5f * k)
+                              lineTo(px + 8f * k, py + 14f * k)
+                              lineTo(px + 14.5f * k, py + 14f * k)
+                              close()
+                          }
+                          drawPath(arrow, Color.White)
+                          drawPath(arrow, Color.Black, style = Stroke(width = 1.5f * density))
+                      }
+                  }
+                  Text(
+                      if (session == null) "Esperando al puntero…"
+                      else "Deslizá para mover\nTocá = clic · Mantené = clic largo\n2 dedos = scroll",
+                      Modifier.align(Alignment.Center),
+                      color = Color.White.copy(alpha = 0.35f),
+                      fontSize = 13.sp,
+                      fontWeight = FontWeight.Medium,
+                      textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                  )
+              }
+          }
+
+          @Composable
+          private fun ScrollStrip(modifier: Modifier, session: PointerSession?) {
+              val shape = RoundedCornerShape(22.dp)
+              val sess by rememberUpdatedState(session)
+              Box(
+                  modifier
+                      .background(Brush.verticalGradient(listOf(Color(0xFF3B1F6B), Color(0xFF1E1B4B))), shape)
+                      .border(1.5.dp, TvPurple.copy(alpha = 0.6f), shape)
+                      .pointerInput(Unit) {
+                          detectVerticalDragGestures { change, dragAmount ->
+                              change.consume()
+                              sess?.send("W 0 $dragAmount")
+                          }
+                      },
+                  contentAlignment = Alignment.Center
+              ) {
+                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                      Text("▲", color = Color.White.copy(alpha = 0.6f), fontSize = 18.sp)
+                      Spacer(Modifier.height(10.dp))
+                      Text("SCROLL", color = Color.White.copy(alpha = 0.45f), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(10.dp))
+                      Text("▼", color = Color.White.copy(alpha = 0.6f), fontSize = 18.sp)
                   }
               }
           }
@@ -1799,11 +2642,13 @@ jobs:
           val TvBg = Color(0xFF0B1220)
           val TvSurface = Color(0xFF131C31)
 
+          /** Estado que sobrevive al cambiar de pestaña. */
           object UiState {
               var filesPath by mutableStateOf("/sdcard")
               var shellLog by mutableStateOf("")
               var shellCmd by mutableStateOf("")
 
+              /** Posición de scroll (índice, desplazamiento) guardada por carpeta. */
               val positions = HashMap<String, Pair<Int, Int>>()
 
               fun canUp(): Boolean = filesPath != "/" && filesPath != "/sdcard"
@@ -1830,6 +2675,11 @@ jobs:
               )
           }
 
+          /**
+           * Botón con efecto 3D: cara con degradado y borde de luz, canto oscuro debajo
+           * y se "hunde" al presionarlo.
+           * [wide] hace que la cara ocupe todo el ancho que le da el modificador.
+           */
           @Composable
           fun Btn3D(
               text: String,
@@ -1892,254 +2742,6 @@ jobs:
               )
           }
           TVEOF
-          mkdir -p app/src/main/java/com/tvcontrol
-          cat > app/src/main/java/com/tvcontrol/Connect.kt <<'TVEOF'
-          package com.tvcontrol
-
-          import androidx.compose.animation.core.LinearEasing
-          import androidx.compose.animation.core.animateFloat
-          import androidx.compose.animation.core.infiniteRepeatable
-          import androidx.compose.animation.core.rememberInfiniteTransition
-          import androidx.compose.animation.core.tween
-          import androidx.compose.foundation.Canvas
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.border
-          import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.rememberScrollState
-          import androidx.compose.foundation.shape.CircleShape
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.foundation.verticalScroll
-          import androidx.compose.material3.*
-          import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.graphics.Brush
-          import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.graphics.drawscope.Stroke
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.text.style.TextAlign
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-          import kotlinx.coroutines.*
-          import kotlinx.coroutines.sync.Semaphore
-          import kotlinx.coroutines.sync.withPermit
-          import java.net.Inet4Address
-          import java.net.InetAddress
-          import java.net.InetSocketAddress
-          import java.net.NetworkInterface
-          import java.net.Socket
-          import java.util.concurrent.atomic.AtomicInteger
-
-          data class Found(val ip: String, val port: Int, val name: String? = null)
-
-          private fun localBase(): String? = try {
-              NetworkInterface.getNetworkInterfaces().toList()
-                  .filter { it.isUp && !it.isLoopback }
-                  .sortedByDescending { it.name.startsWith("wlan") }
-                  .flatMap { it.inetAddresses.toList() }
-                  .filterIsInstance<Inet4Address>()
-                  .firstOrNull { it.isSiteLocalAddress }
-                  ?.hostAddress?.substringBeforeLast('.')
-          } catch (_: Exception) { null }
-
-          private fun portOpen(ip: String, port: Int, timeoutMs: Int = 700): Boolean = try {
-              Socket().use { it.connect(InetSocketAddress(ip, port), timeoutMs); true }
-          } catch (_: Exception) { false }
-
-          @Composable
-          private fun Radar(modifier: Modifier = Modifier) {
-              val t = rememberInfiniteTransition(label = "radar")
-              val p by t.animateFloat(
-                  initialValue = 0f, targetValue = 1f,
-                  animationSpec = infiniteRepeatable(tween(2400, easing = LinearEasing)),
-                  label = "p"
-              )
-              Canvas(modifier) {
-                  val maxR = size.minDimension / 2
-                  for (k in 0..2) {
-                      val q = (p + k / 3f) % 1f
-                      drawCircle(TvBlue.copy(alpha = (1f - q) * 0.5f), radius = maxR * q, center = center, style = Stroke(width = 3f))
-                  }
-                  drawCircle(TvBlue, radius = 10f, center = center)
-              }
-          }
-
-          @Composable
-          private fun DeviceCard(f: Found, enabled: Boolean, onClick: () -> Unit) {
-              val shape = RoundedCornerShape(14.dp)
-              Row(
-                  Modifier.fillMaxWidth().padding(top = 8.dp)
-                      .background(Color.White.copy(alpha = 0.06f), shape)
-                      .border(1.dp, Color.White.copy(alpha = 0.12f), shape)
-                      .padding(12.dp),
-                  verticalAlignment = Alignment.CenterVertically
-              ) {
-                  Box(
-                      Modifier.size(44.dp).background(TvBlue.copy(alpha = 0.25f), RoundedCornerShape(12.dp)),
-                      contentAlignment = Alignment.Center
-                  ) { Text("📺", fontSize = 22.sp) }
-                  Spacer(Modifier.width(12.dp))
-                  Column(Modifier.weight(1f)) {
-                      Text(f.name ?: "Dispositivo Android", fontWeight = FontWeight.SemiBold, maxLines = 1)
-                      Text(
-                          "${f.ip}:${f.port}",
-                          style = MaterialTheme.typography.bodySmall,
-                          color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
-                      )
-                  }
-                  Btn3D("Conectar", onClick, color = TvGreen, enabled = enabled, small = true)
-              }
-          }
-
-          @Composable
-          fun ConnectScreen(
-              savedHost: String,
-              savedPort: String,
-              busy: Boolean,
-              error: String,
-              onConnect: (String, Int) -> Unit
-          ) {
-              var host by remember { mutableStateOf(savedHost) }
-              var port by remember { mutableStateOf(savedPort) }
-              val found = remember { mutableStateListOf<Found>() }
-              var scanning by remember { mutableStateOf(true) }
-              var progress by remember { mutableIntStateOf(0) }
-              var round by remember { mutableIntStateOf(0) }
-              var subnet by remember { mutableStateOf("") }
-              var noNet by remember { mutableStateOf(false) }
-
-              LaunchedEffect(round) {
-                  found.clear(); progress = 0; scanning = true; noNet = false
-                  val base = withContext(Dispatchers.IO) { localBase() }
-                  if (base == null) { noNet = true; scanning = false; return@LaunchedEffect }
-                  subnet = base
-                  val ports = listOf(5555, port.toIntOrNull() ?: 5555).distinct()
-                  val sem = Semaphore(48)
-                  val done = AtomicInteger(0)
-                  coroutineScope {
-                      (1..254).map { i ->
-                          launch(Dispatchers.IO) {
-                              val ip = "$base.$i"
-                              sem.withPermit {
-                                  for (p in ports) {
-                                      if (portOpen(ip, p)) {
-                                          withContext(Dispatchers.Main) { found.add(Found(ip, p)) }
-                                          break
-                                      }
-                                  }
-                              }
-                              val d = done.incrementAndGet()
-                              withContext(Dispatchers.Main) { progress = d }
-                          }
-                      }.joinAll()
-                  }
-                  scanning = false
-                  found.sortBy { it.ip.substringAfterLast('.').toIntOrNull() ?: 0 }
-
-                  val snap = found.toList()
-                  val names = withContext(Dispatchers.IO) {
-                      snap.map { f ->
-                          async { runCatching { InetAddress.getByName(f.ip).canonicalHostName }.getOrNull() }
-                      }.awaitAll()
-                  }
-                  snap.forEachIndexed { i, f ->
-                      val n = names[i]
-                      if (n != null && n != f.ip) {
-                          val k = found.indexOfFirst { it.ip == f.ip && it.port == f.port }
-                          if (k >= 0) found[k] = f.copy(name = n)
-                      }
-                  }
-              }
-
-              val bg = Brush.verticalGradient(listOf(Color(0xFF16305F), TvBg, Color(0xFF060A14)))
-              val muted = Color(0xFF94A3B8)
-
-              Column(
-                  Modifier.fillMaxSize().background(bg).systemBarsPadding()
-                      .verticalScroll(rememberScrollState()).padding(20.dp),
-                  horizontalAlignment = Alignment.CenterHorizontally
-              ) {
-                  Spacer(Modifier.height(8.dp))
-                  Box(
-                      Modifier.size(88.dp)
-                          .background(Brush.linearGradient(listOf(TvBlue, TvPurple)), CircleShape)
-                          .border(2.dp, Color.White.copy(alpha = 0.35f), CircleShape),
-                      contentAlignment = Alignment.Center
-                  ) { Text("📺", fontSize = 40.sp) }
-                  Spacer(Modifier.height(12.dp))
-                  Text("TV Control", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                  Text(
-                      "Controlá tu TV o box Android desde el teléfono",
-                      fontSize = 14.sp, color = muted, textAlign = TextAlign.Center
-                  )
-                  Spacer(Modifier.height(20.dp))
-
-                  Panel {
-                      Row(verticalAlignment = Alignment.CenterVertically) {
-                          Text("📡 Dispositivos en tu red", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
-                          if (scanning) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                      }
-                      Text(
-                          when {
-                              noNet -> "Sin red wifi"
-                              scanning -> "Buscando en $subnet.x…  $progress/254"
-                              found.isEmpty() -> "Búsqueda terminada"
-                              else -> "${found.size} encontrado(s)"
-                          },
-                          style = MaterialTheme.typography.bodySmall, color = muted
-                      )
-                      if (scanning && found.isEmpty()) {
-                          Radar(Modifier.fillMaxWidth().height(140.dp))
-                      }
-                      found.forEach { f -> DeviceCard(f, !busy) { onConnect(f.ip, f.port) } }
-                      if (!scanning && found.isEmpty()) {
-                          Spacer(Modifier.height(8.dp))
-                          Text(
-                              if (noNet) "Conectate al mismo wifi que la TV y buscá de nuevo."
-                              else "No apareció ningún equipo. Activá la depuración por red en la TV " +
-                                  "(Opciones de desarrollador) y buscá de nuevo, o escribí la IP abajo.",
-                              style = MaterialTheme.typography.bodySmall, color = muted
-                          )
-                      }
-                      Spacer(Modifier.height(10.dp))
-                      Btn3D("🔄 Buscar de nuevo", { round++ }, color = TvSlate, enabled = !scanning && !busy, small = true)
-                  }
-
-                  Spacer(Modifier.height(14.dp))
-
-                  Panel {
-                      Text("✍ Conectar por IP", style = MaterialTheme.typography.titleSmall)
-                      Spacer(Modifier.height(8.dp))
-                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                          OutlinedTextField(host, { host = it }, label = { Text("IP de la TV") },
-                              singleLine = true, modifier = Modifier.weight(2f))
-                          OutlinedTextField(port, { port = it }, label = { Text("Puerto") },
-                              singleLine = true, modifier = Modifier.weight(1f))
-                      }
-                      Spacer(Modifier.height(10.dp))
-                      Btn3D(
-                          "Conectar",
-                          { onConnect(host.trim(), port.trim().toIntOrNull() ?: 5555) },
-                          Modifier.fillMaxWidth(),
-                          enabled = !busy && host.isNotBlank(),
-                          wide = true
-                      )
-                  }
-
-                  if (busy) {
-                      Spacer(Modifier.height(14.dp))
-                      LinearProgressIndicator(Modifier.fillMaxWidth())
-                      Spacer(Modifier.height(6.dp))
-                      Text("Conectando… aceptá el aviso en la TV", style = MaterialTheme.typography.bodySmall, color = muted)
-                  }
-                  if (error.isNotEmpty()) {
-                      Spacer(Modifier.height(10.dp))
-                      Text(error, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
-                  }
-                  Spacer(Modifier.height(16.dp))
-              }
-          }
-          TVEOF
           mkdir -p app/src/main/res/drawable
           cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'TVEOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -2198,6 +2800,24 @@ jobs:
           <resources>
               <color name="ic_launcher_background">#0F172A</color>
           </resources>
+          TVEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'TVEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="pointer_desc">Muestra un puntero en la TV y hace los toques y el scroll que se piden desde el teléfono con TV Control.</string>
+          </resources>
+          TVEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/pointer_service.xml <<'TVEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:description="@string/pointer_desc"
+              android:notificationTimeout="100" />
           TVEOF
           mkdir -p app
           cat > app/tvcontrol.keystore.b64 <<'TVEOF'
@@ -2280,655 +2900,6 @@ jobs:
           include(":app")
           TVEOF
           base64 -d app/tvcontrol.keystore.b64 > app/tvcontrol.keystore
-
-      - name: Compilar helper de puntero para la TV
-        run: |
-          mkdir -p ptr_src app/src/main/assets
-          cat > ptr_src/TvPointer.java <<'PTREOF'
-          import android.content.Context;
-          import android.graphics.Canvas;
-          import android.graphics.Color;
-          import android.graphics.Paint;
-          import android.graphics.Path;
-          import android.graphics.PixelFormat;
-          import android.hardware.display.DisplayManager;
-          import android.hardware.input.InputManager;
-          import android.os.Binder;
-          import android.os.Build;
-          import android.os.Handler;
-          import android.os.Looper;
-          import android.os.SystemClock;
-          import android.view.Display;
-          import android.view.Gravity;
-          import android.view.InputDevice;
-          import android.view.InputEvent;
-          import android.view.MotionEvent;
-          import android.view.View;
-          import android.view.WindowManager;
-          import java.io.BufferedReader;
-          import java.io.InputStreamReader;
-          import java.io.OutputStream;
-          import java.lang.reflect.Method;
-          import java.net.InetSocketAddress;
-          import java.net.ServerSocket;
-          import java.net.Socket;
-
-          public class TvPointer {
-              private static WindowManager wm;
-              private static PointerView view;
-              private static WindowManager.LayoutParams lp;
-              private static Handler mainHandler;
-              private static InputManager im;
-              private static Method injectMethod;
-              private static volatile boolean overlayAttached = false;
-              private static float curX = 960f;
-              private static float curY = 540f;
-              private static long lastActivity = System.currentTimeMillis();
-
-              static class PointerView extends View {
-                  private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
-                  private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
-                  private final Path arrow = new Path();
-
-                  public PointerView(Context ctx) {
-                      super(ctx);
-                      fill.setColor(Color.WHITE);
-                      fill.setStyle(Paint.Style.FILL);
-                      stroke.setColor(Color.BLACK);
-                      stroke.setStyle(Paint.Style.STROKE);
-                      stroke.setStrokeWidth(3f);
-                      stroke.setStrokeJoin(Paint.Join.ROUND);
-
-                      arrow.moveTo(0f, 0f);
-                      arrow.lineTo(0f, 36f);
-                      arrow.lineTo(9f, 28f);
-                      arrow.lineTo(15.5f, 41f);
-                      arrow.lineTo(21f, 38.5f);
-                      arrow.lineTo(14.5f, 25.5f);
-                      arrow.lineTo(26f, 25.5f);
-                      arrow.close();
-                  }
-
-                  @Override
-                  protected void onDraw(Canvas canvas) {
-                      canvas.save();
-                      canvas.translate(2f, 2f);
-                      canvas.drawPath(arrow, fill);
-                      canvas.drawPath(arrow, stroke);
-                      canvas.restore();
-                  }
-              }
-
-              private static Context obtainSystemContext() throws Exception {
-                  Class<?> atClass = Class.forName("android.app.ActivityThread");
-                  Method systemMain = atClass.getMethod("systemMain");
-                  Object at = systemMain.invoke(null);
-                  Method getSystemContext = atClass.getMethod("getSystemContext");
-                  Context sysCtx = (Context) getSystemContext.invoke(at);
-                  try {
-                      DisplayManager dm = (DisplayManager) sysCtx.getSystemService(Context.DISPLAY_SERVICE);
-                      if (dm != null) {
-                          Display d = dm.getDisplay(Display.DEFAULT_DISPLAY);
-                          if (d != null) {
-                              return sysCtx.createDisplayContext(d);
-                          }
-                      }
-                  } catch (Throwable ignored) {}
-                  return sysCtx;
-              }
-
-              private static void tryAttachOverlay(Context ctx) {
-                  try {
-                      wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
-                      if (wm == null) return;
-                      view = new PointerView(ctx);
-
-                      int[] candidateTypes = Build.VERSION.SDK_INT >= 26
-                              ? new int[]{2038, 2032, 2003, 2006, 2005, 2002}
-                              : new int[]{2003, 2006, 2005, 2002};
-
-                      Binder token = new Binder();
-                      for (int type : candidateTypes) {
-                          try {
-                              WindowManager.LayoutParams p = new WindowManager.LayoutParams(
-                                      56, 64,
-                                      type,
-                                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                              | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                              | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                                              | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                                      PixelFormat.TRANSLUCENT
-                              );
-                              p.gravity = Gravity.TOP | Gravity.START;
-                              p.x = Math.round(curX);
-                              p.y = Math.round(curY);
-                              p.token = token;
-                              try {
-                                  p.getClass().getField("privateFlags").setInt(p, 0x00000010);
-                              } catch (Throwable ignored) {}
-
-                              wm.addView(view, p);
-                              lp = p;
-                              overlayAttached = true;
-                              mainHandler.post(() -> {
-                                  try {
-                                      view.setVisibility(View.VISIBLE);
-                                      view.invalidate();
-                                  } catch (Throwable ignored) {}
-                              });
-                              System.out.println("TvPointer: overlay attached type=" + type);
-                              return;
-                          } catch (Throwable e) {
-                              System.out.println("TvPointer: overlay failed type=" + type + " err=" + e);
-                          }
-                      }
-                  } catch (Throwable outer) {
-                      System.out.println("TvPointer: overlay init error=" + outer);
-                  }
-              }
-
-              public static void main(String[] args) {
-                  try {
-                      Looper.prepareMainLooper();
-                      mainHandler = new Handler(Looper.getMainLooper());
-
-                      Context ctx = obtainSystemContext();
-                      im = (InputManager) ctx.getSystemService(Context.INPUT_SERVICE);
-                      injectMethod = InputManager.class.getMethod("injectInputEvent", InputEvent.class, int.class);
-
-                      new Thread(TvPointer::runServer, "tvptr-srv").start();
-
-                      mainHandler.postDelayed(() -> tryAttachOverlay(ctx), 400L);
-
-                      mainHandler.postDelayed(new Runnable() {
-                          @Override
-                          public void run() {
-                              if (System.currentTimeMillis() - lastActivity > 20 * 60 * 1000L) {
-                                  System.exit(0);
-                              }
-                              mainHandler.postDelayed(this, 60_000L);
-                          }
-                      }, 60_000L);
-
-                      Looper.loop();
-                  } catch (Throwable t) {
-                      t.printStackTrace();
-                      System.exit(1);
-                  }
-              }
-
-              private static void moveOverlay(final float x, final float y, final boolean visible) {
-                  curX = x;
-                  curY = y;
-                  if (!overlayAttached || view == null || wm == null || lp == null) return;
-                  mainHandler.post(() -> {
-                      try {
-                          view.setVisibility(visible ? View.VISIBLE : View.GONE);
-                          lp.x = Math.round(x) - 2;
-                          lp.y = Math.round(y) - 2;
-                          wm.updateViewLayout(view, lp);
-                          view.invalidate();
-                      } catch (Throwable ignored) {}
-                  });
-              }
-
-              private static void injectMotion(int action, float x, float y, int source, int buttonState, float vScroll, long downTime) {
-                  try {
-                      long now = SystemClock.uptimeMillis();
-                      MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
-                      props[0] = new MotionEvent.PointerProperties();
-                      props[0].id = 0;
-                      props[0].toolType = (source == InputDevice.SOURCE_MOUSE)
-                              ? MotionEvent.TOOL_TYPE_MOUSE
-                              : MotionEvent.TOOL_TYPE_FINGER;
-
-                      MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
-                      coords[0] = new MotionEvent.PointerCoords();
-                      coords[0].x = x;
-                      coords[0].y = y;
-                      coords[0].pressure = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_HOVER_MOVE || action == MotionEvent.ACTION_SCROLL) ? 0f : 1f;
-                      coords[0].size = 1f;
-                      if (vScroll != 0f) {
-                          coords[0].setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll);
-                      }
-
-                      MotionEvent ev = MotionEvent.obtain(
-                              downTime, now, action,
-                              1, props, coords,
-                              0, buttonState,
-                              1f, 1f,
-                              0, 0, source, 0
-                      );
-                      injectMethod.invoke(im, ev, 0);
-                      ev.recycle();
-                  } catch (Throwable ignored) {}
-              }
-
-              private static void doHover(float x, float y) {
-                  moveOverlay(x, y, true);
-                  long now = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_HOVER_MOVE, x, y, InputDevice.SOURCE_MOUSE, 0, 0f, now);
-              }
-
-              private static void doClick(float x, float y) {
-                  moveOverlay(x, y, true);
-                  long down = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-                  SystemClock.sleep(35);
-                  injectMotion(MotionEvent.ACTION_UP, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-              }
-
-              private static void doLongClick(float x, float y) {
-                  moveOverlay(x, y, true);
-                  long down = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-                  SystemClock.sleep(650);
-                  injectMotion(MotionEvent.ACTION_UP, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-              }
-
-              private static void doWheelScroll(float x, float y, float delta) {
-                  moveOverlay(x, y, true);
-                  long now = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_HOVER_MOVE, x, y, InputDevice.SOURCE_MOUSE, 0, 0f, now);
-                  injectMotion(MotionEvent.ACTION_SCROLL, x, y, InputDevice.SOURCE_MOUSE, 0, delta, now);
-                  // Respaldo de desplazamiento táctil corto en la coordenada del puntero para vistas/TVs que ignoran AXIS_VSCROLL
-                  float dy = delta > 0 ? -120f : 120f;
-                  float yEnd = Math.max(20f, Math.min(2160f, y + dy));
-                  long down = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-                  int steps = 6;
-                  for (int i = 1; i <= steps; i++) {
-                      SystemClock.sleep(15);
-                      float iy = y + (yEnd - y) * (i / (float) steps);
-                      injectMotion(MotionEvent.ACTION_MOVE, x, iy, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-                  }
-                  SystemClock.sleep(15);
-                  injectMotion(MotionEvent.ACTION_UP, x, yEnd, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-                  injectMotion(MotionEvent.ACTION_HOVER_MOVE, x, y, InputDevice.SOURCE_MOUSE, 0, 0f, SystemClock.uptimeMillis());
-              }
-
-              private static void runServer() {
-                  ServerSocket bound = null;
-                  int boundPort = -1;
-                  for (int port = 15556; port <= 15565; port++) {
-                      try {
-                          ServerSocket ss = new ServerSocket();
-                          ss.setReuseAddress(true);
-                          ss.bind(new InetSocketAddress(port));
-                          bound = ss;
-                          boundPort = port;
-                          break;
-                      } catch (Throwable ignored) { }
-                  }
-                  if (bound == null) {
-                      System.out.println("TvPointer: no free port in 15556..15565");
-                      System.exit(1);
-                      return;
-                  }
-                  System.out.println("TvPointer: listening on " + boundPort);
-                  try (ServerSocket ss = bound) {
-                      while (true) {
-                          Socket s = ss.accept();
-                          s.setTcpNoDelay(true);
-                          new Thread(() -> handleClient(s)).start();
-                      }
-                  } catch (Throwable t) {
-                      t.printStackTrace();
-                      System.exit(1);
-                  }
-              }
-
-              private static void handleClient(Socket s) {
-                  try (BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()));
-                       OutputStream out = s.getOutputStream()) {
-                      String line;
-                      while ((line = br.readLine()) != null) {
-                          lastActivity = System.currentTimeMillis();
-                          String[] p = line.trim().split(" ");
-                          if (p.length == 0) continue;
-                          switch (p[0]) {
-                              case "PING":
-                                  String pong = "PONG OVL=" + (overlayAttached ? "1" : "0") + "\n";
-                                  out.write(pong.getBytes());
-                                  out.flush();
-                                  break;
-                              case "M":
-                                  if (p.length >= 3) doHover(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
-                                  break;
-                              case "C":
-                                  if (p.length >= 3) doClick(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
-                                  break;
-                              case "L":
-                                  if (p.length >= 3) doLongClick(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
-                                  break;
-                              case "S":
-                                  if (p.length >= 4) doWheelScroll(Float.parseFloat(p[1]), Float.parseFloat(p[2]), Float.parseFloat(p[3]));
-                                  break;
-                              case "H":
-                                  moveOverlay(curX, curY, false);
-                                  break;
-                              case "Q":
-                                  System.exit(0);
-                                  break;
-                          }
-                      }
-                  } catch (Throwable ignored) {}
-              }
-          }
-          PTREOF
-          ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
-          D8_BIN=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -n 1)
-          javac --release 8 -cp "$ANDROID_JAR" -d ptr_src ptr_src/TvPointer.java
-          "$D8_BIN" --min-api 21 --output app/src/main/assets ptr_src/*.class
-          mv app/src/main/assets/classes.dex app/src/main/assets/tvptr.dex
-          ls -lh app/src/main/assets/tvptr.dex
-
-      - name: Compilar helper de puntero para la TV
-        run: |
-          mkdir -p ptr_src app/src/main/assets
-          cat > ptr_src/TvPointer.java <<'PTREOF'
-          import android.content.Context;
-          import android.graphics.Canvas;
-          import android.graphics.Color;
-          import android.graphics.Paint;
-          import android.graphics.Path;
-          import android.graphics.PixelFormat;
-          import android.hardware.input.InputManager;
-          import android.os.Build;
-          import android.os.Handler;
-          import android.os.Looper;
-          import android.os.SystemClock;
-          import android.view.Gravity;
-          import android.view.InputDevice;
-          import android.view.InputEvent;
-          import android.view.MotionEvent;
-          import android.view.View;
-          import android.view.WindowManager;
-          import java.io.BufferedReader;
-          import java.io.InputStreamReader;
-          import java.io.OutputStream;
-          import java.lang.reflect.Method;
-          import java.net.InetSocketAddress;
-          import java.net.ServerSocket;
-          import java.net.Socket;
-
-          public class TvPointer {
-              private static WindowManager wm;
-              private static PointerView view;
-              private static WindowManager.LayoutParams lp;
-              private static Handler mainHandler;
-              private static InputManager im;
-              private static Method injectMethod;
-              private static volatile boolean overlayAttached = false;
-              private static float curX = 960f;
-              private static float curY = 540f;
-              private static long lastActivity = System.currentTimeMillis();
-
-              static class PointerView extends View {
-                  private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
-                  private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
-                  private final Path arrow = new Path();
-
-                  public PointerView(Context ctx) {
-                      super(ctx);
-                      fill.setColor(Color.WHITE);
-                      fill.setStyle(Paint.Style.FILL);
-                      stroke.setColor(Color.BLACK);
-                      stroke.setStyle(Paint.Style.STROKE);
-                      stroke.setStrokeWidth(2.6f);
-                      stroke.setStrokeJoin(Paint.Join.ROUND);
-
-                      arrow.moveTo(0f, 0f);
-                      arrow.lineTo(0f, 34f);
-                      arrow.lineTo(8.5f, 26.5f);
-                      arrow.lineTo(14.5f, 39f);
-                      arrow.lineTo(19.5f, 36.5f);
-                      arrow.lineTo(13.5f, 24f);
-                      arrow.lineTo(24.5f, 24f);
-                      arrow.close();
-                  }
-
-                  @Override
-                  protected void onDraw(Canvas canvas) {
-                      canvas.save();
-                      canvas.translate(2f, 2f);
-                      canvas.drawPath(arrow, fill);
-                      canvas.drawPath(arrow, stroke);
-                      canvas.restore();
-                  }
-              }
-
-              private static Context obtainSystemContext() throws Exception {
-                  Class<?> atClass = Class.forName("android.app.ActivityThread");
-                  Method systemMain = atClass.getMethod("systemMain");
-                  Object at = systemMain.invoke(null);
-                  Method getSystemContext = atClass.getMethod("getSystemContext");
-                  return (Context) getSystemContext.invoke(at);
-              }
-
-              private static void tryAttachOverlay(Context ctx) {
-                  try {
-                      wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
-                      if (wm == null) return;
-                      view = new PointerView(ctx);
-
-                      int[] candidateTypes = Build.VERSION.SDK_INT >= 26
-                              ? new int[]{2038, 2032, 2003, 2006, 2002}
-                              : new int[]{2003, 2006, 2002, 2005};
-
-                      for (int type : candidateTypes) {
-                          try {
-                              WindowManager.LayoutParams p = new WindowManager.LayoutParams(
-                                      48, 56,
-                                      type,
-                                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                              | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                              | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                                              | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                                      PixelFormat.TRANSLUCENT
-                              );
-                              p.gravity = Gravity.TOP | Gravity.START;
-                              p.x = (int) curX;
-                              p.y = (int) curY;
-                              try {
-                                  p.getClass().getField("privateFlags").setInt(p, 0x00000010);
-                              } catch (Throwable ignored) {}
-
-                              wm.addView(view, p);
-                              lp = p;
-                              overlayAttached = true;
-                              System.out.println("TvPointer: overlay attached type=" + type);
-                              return;
-                          } catch (Throwable e) {
-                              System.out.println("TvPointer: overlay failed type=" + type + " err=" + e);
-                          }
-                      }
-                  } catch (Throwable outer) {
-                      System.out.println("TvPointer: overlay init error=" + outer);
-                  }
-              }
-
-              public static void main(String[] args) {
-                  try {
-                      Looper.prepareMainLooper();
-                      mainHandler = new Handler(Looper.getMainLooper());
-
-                      Context ctx = obtainSystemContext();
-                      im = (InputManager) ctx.getSystemService(Context.INPUT_SERVICE);
-                      injectMethod = InputManager.class.getMethod("injectInputEvent", InputEvent.class, int.class);
-
-                      // Levantar servidor TCP primero para que nunca quede bloqueado por el overlay
-                      new Thread(TvPointer::runServer, "tvptr-srv").start();
-
-                      // Intentar adjuntar flecha visual con tipos de respaldo
-                      tryAttachOverlay(ctx);
-
-                      mainHandler.postDelayed(new Runnable() {
-                          @Override
-                          public void run() {
-                              if (System.currentTimeMillis() - lastActivity > 20 * 60 * 1000L) {
-                                  System.exit(0);
-                              }
-                              mainHandler.postDelayed(this, 60_000L);
-                          }
-                      }, 60_000L);
-
-                      Looper.loop();
-                  } catch (Throwable t) {
-                      t.printStackTrace();
-                      System.exit(1);
-                  }
-              }
-
-              private static void moveOverlay(final float x, final float y, final boolean visible) {
-                  curX = x;
-                  curY = y;
-                  if (!overlayAttached || view == null || wm == null || lp == null) return;
-                  mainHandler.post(() -> {
-                      try {
-                          view.setVisibility(visible ? View.VISIBLE : View.GONE);
-                          lp.x = Math.round(x) - 2;
-                          lp.y = Math.round(y) - 2;
-                          wm.updateViewLayout(view, lp);
-                      } catch (Throwable ignored) {}
-                  });
-              }
-
-              private static void injectMotion(int action, float x, float y, int source, int buttonState, float vScroll, long downTime) {
-                  try {
-                      long now = SystemClock.uptimeMillis();
-                      MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
-                      props[0] = new MotionEvent.PointerProperties();
-                      props[0].id = 0;
-                      props[0].toolType = (source == InputDevice.SOURCE_MOUSE)
-                              ? MotionEvent.TOOL_TYPE_MOUSE
-                              : MotionEvent.TOOL_TYPE_FINGER;
-
-                      MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
-                      coords[0] = new MotionEvent.PointerCoords();
-                      coords[0].x = x;
-                      coords[0].y = y;
-                      coords[0].pressure = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_HOVER_MOVE || action == MotionEvent.ACTION_SCROLL) ? 0f : 1f;
-                      coords[0].size = 1f;
-                      if (vScroll != 0f) {
-                          coords[0].setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll);
-                      }
-
-                      MotionEvent ev = MotionEvent.obtain(
-                              downTime, now, action,
-                              1, props, coords,
-                              0, buttonState,
-                              1f, 1f,
-                              0, 0, source, 0
-                      );
-                      injectMethod.invoke(im, ev, 0);
-                      ev.recycle();
-                  } catch (Throwable ignored) {}
-              }
-
-              private static void doHover(float x, float y) {
-                  moveOverlay(x, y, true);
-                  long now = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_HOVER_MOVE, x, y, InputDevice.SOURCE_MOUSE, 0, 0f, now);
-              }
-
-              private static void doClick(float x, float y) {
-                  moveOverlay(x, y, true);
-                  long down = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-                  SystemClock.sleep(35);
-                  injectMotion(MotionEvent.ACTION_UP, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-              }
-
-              private static void doLongClick(float x, float y) {
-                  moveOverlay(x, y, true);
-                  long down = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_DOWN, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-                  SystemClock.sleep(650);
-                  injectMotion(MotionEvent.ACTION_UP, x, y, InputDevice.SOURCE_TOUCHSCREEN, 0, 0f, down);
-              }
-
-              private static void doWheelScroll(float x, float y, float delta) {
-                  moveOverlay(x, y, true);
-                  long now = SystemClock.uptimeMillis();
-                  injectMotion(MotionEvent.ACTION_SCROLL, x, y, InputDevice.SOURCE_MOUSE, 0, delta, now);
-              }
-
-              private static void runServer() {
-                  ServerSocket bound = null;
-                  int boundPort = -1;
-                  for (int port = 15556; port <= 15565; port++) {
-                      try {
-                          ServerSocket ss = new ServerSocket();
-                          ss.setReuseAddress(true);
-                          ss.bind(new InetSocketAddress(port));
-                          bound = ss;
-                          boundPort = port;
-                          break;
-                      } catch (Throwable ignored) { }
-                  }
-                  if (bound == null) {
-                      System.out.println("TvPointer: no free port in 15556..15565");
-                      System.exit(1);
-                      return;
-                  }
-                  System.out.println("TvPointer: listening on " + boundPort);
-                  try (ServerSocket ss = bound) {
-                      while (true) {
-                          Socket s = ss.accept();
-                          s.setTcpNoDelay(true);
-                          new Thread(() -> handleClient(s)).start();
-                      }
-                  } catch (Throwable t) {
-                      t.printStackTrace();
-                      System.exit(1);
-                  }
-              }
-
-              private static void handleClient(Socket s) {
-                  try (BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()));
-                       OutputStream out = s.getOutputStream()) {
-                      String line;
-                      while ((line = br.readLine()) != null) {
-                          lastActivity = System.currentTimeMillis();
-                          String[] p = line.trim().split(" ");
-                          if (p.length == 0) continue;
-                          switch (p[0]) {
-                              case "PING":
-                                  String pong = "PONG OVL=" + (overlayAttached ? "1" : "0") + "\n";
-                                  out.write(pong.getBytes());
-                                  out.flush();
-                                  break;
-                              case "M":
-                                  if (p.length >= 3) doHover(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
-                                  break;
-                              case "C":
-                                  if (p.length >= 3) doClick(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
-                                  break;
-                              case "L":
-                                  if (p.length >= 3) doLongClick(Float.parseFloat(p[1]), Float.parseFloat(p[2]));
-                                  break;
-                              case "S":
-                                  if (p.length >= 4) doWheelScroll(Float.parseFloat(p[1]), Float.parseFloat(p[2]), Float.parseFloat(p[3]));
-                                  break;
-                              case "H":
-                                  moveOverlay(curX, curY, false);
-                                  break;
-                              case "Q":
-                                  System.exit(0);
-                                  break;
-                          }
-                      }
-                  } catch (Throwable ignored) {}
-              }
-          }
-          PTREOF
-          ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
-          D8_BIN=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -n 1)
-          javac --release 8 -cp "$ANDROID_JAR" -d ptr_src ptr_src/TvPointer.java
-          "$D8_BIN" --min-api 21 --output app/src/main/assets ptr_src/*.class
-          mv app/src/main/assets/classes.dex app/src/main/assets/tvptr.dex
-          ls -lh app/src/main/assets/tvptr.dex
 
       - name: Compilar
         run: gradle assembleDebug --stacktrace
