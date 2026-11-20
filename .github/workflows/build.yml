@@ -1125,6 +1125,145 @@ jobs:
           }
           TVEOF
           mkdir -p app/src/main/java/com/tvcontrol
+          cat > app/src/main/java/com/tvcontrol/Inject.kt <<'TVEOF'
+          package com.tvcontrol
+
+          import android.os.SystemClock
+          import android.view.InputDevice
+          import android.view.InputEvent
+          import android.view.MotionEvent
+          import java.lang.reflect.Method
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
+
+          /**
+           * Corre EN LA TV con permisos de shell (lo lanza el teléfono con app_process, igual que scrcpy).
+           * Inyecta eventos de MOUSE de verdad (con botón y rueda): así las páginas web de los navegadores
+           * responden, cosa que no pasa con "input tap" / "input swipe".
+           * Protocolo (una línea por orden): C x y = clic, LC x y = clic largo, V x y d = rueda (d = 1 sube, -1 baja).
+           */
+          object InjectServer {
+              private var manager: Any? = null
+              private var inject: Method? = null
+              private var argc = 2
+              private val lock = Any()
+
+              private fun init() {
+                  var cls: Class<*>? = null
+                  try {
+                      cls = Class.forName("android.hardware.input.InputManagerGlobal")
+                  } catch (e: Throwable) {
+                  }
+                  if (cls == null) cls = Class.forName("android.hardware.input.InputManager")
+                  val c = cls!!
+                  manager = c.getMethod("getInstance").invoke(null)
+                  try {
+                      inject = c.getMethod("injectInputEvent", InputEvent::class.java, Integer.TYPE)
+                      argc = 2
+                  } catch (e: NoSuchMethodException) {
+                      inject = c.getMethod("injectInputEvent", InputEvent::class.java, Integer.TYPE, Integer.TYPE)
+                      argc = 3
+                  }
+              }
+
+              private fun send(e: MotionEvent) {
+                  try {
+                      if (argc == 2) inject!!.invoke(manager, e, 0) else inject!!.invoke(manager, e, 0, -1)
+                  } finally {
+                      e.recycle()
+                  }
+              }
+
+              private fun ev(action: Int, x: Float, y: Float, buttons: Int, down: Long, scroll: Float = 0f): MotionEvent {
+                  val p = MotionEvent.PointerProperties()
+                  p.id = 0
+                  p.toolType = MotionEvent.TOOL_TYPE_MOUSE
+                  val c = MotionEvent.PointerCoords()
+                  c.x = x
+                  c.y = y
+                  c.pressure = if (buttons != 0) 1f else 0f
+                  c.size = 1f
+                  if (scroll != 0f) c.setAxisValue(MotionEvent.AXIS_VSCROLL, scroll)
+                  return MotionEvent.obtain(
+                      down, SystemClock.uptimeMillis(), action, 1,
+                      arrayOf(p), arrayOf(c), 0, buttons, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0
+                  )
+              }
+
+              private fun click(x: Float, y: Float, holdMs: Long) {
+                  synchronized(lock) {
+                      send(ev(MotionEvent.ACTION_HOVER_MOVE, x, y, 0, SystemClock.uptimeMillis()))
+                      Thread.sleep(25)
+                      val d = SystemClock.uptimeMillis()
+                      send(ev(MotionEvent.ACTION_DOWN, x, y, MotionEvent.BUTTON_PRIMARY, d))
+                      Thread.sleep(holdMs)
+                      send(ev(MotionEvent.ACTION_UP, x, y, 0, d))
+                  }
+              }
+
+              private fun wheel(x: Float, y: Float, amount: Float) {
+                  synchronized(lock) {
+                      val t = SystemClock.uptimeMillis()
+                      send(ev(MotionEvent.ACTION_HOVER_MOVE, x, y, 0, t))
+                      send(ev(MotionEvent.ACTION_SCROLL, x, y, 0, t, amount))
+                  }
+              }
+
+              private fun handle(s: Socket, token: String) {
+                  try {
+                      s.tcpNoDelay = true
+                      s.soTimeout = 4000
+                      val r = s.getInputStream().bufferedReader()
+                      val first = r.readLine() ?: return
+                      if (first != "AUTH $token") return
+                      s.soTimeout = 0
+                      val out = s.getOutputStream()
+                      out.write("OK\n".toByteArray())
+                      out.flush()
+                      while (true) {
+                          val line = r.readLine() ?: break
+                          val p = line.trim().split(' ')
+                          try {
+                              when (p[0]) {
+                                  "C" -> click(p[1].toFloat(), p[2].toFloat(), 40L)
+                                  "LC" -> click(p[1].toFloat(), p[2].toFloat(), 800L)
+                                  "V" -> wheel(p[1].toFloat(), p[2].toFloat(), p[3].toFloat())
+                              }
+                          } catch (e: Exception) {
+                          }
+                      }
+                  } catch (e: Exception) {
+                  } finally {
+                      try {
+                          s.close()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              @JvmStatic
+              fun main(args: Array<String>) {
+                  val port = args[0].toInt()
+                  val token = args[1]
+                  try {
+                      init()
+                  } catch (e: Throwable) {
+                      System.err.println("InjectServer init: $e")
+                      return
+                  }
+                  val ss = ServerSocket()
+                  ss.reuseAddress = true
+                  ss.bind(InetSocketAddress(port))
+                  while (true) {
+                      val s = ss.accept()
+                      Thread { handle(s, token) }.start()
+                  }
+              }
+          }
+          TVEOF
+
+          mkdir -p app/src/main/java/com/tvcontrol
           cat > app/src/main/java/com/tvcontrol/MainActivity.kt <<'TVEOF'
           package com.tvcontrol
 
@@ -1409,6 +1548,9 @@ jobs:
           private const val KEY_STEP = 110f
           private const val WHEEL_STEP = 45f
 
+          /** Puerto del inyector de mouse que corre en la TV (proceso con permisos de shell). */
+          const val INJECT_PORT = 5578
+
           /**
            * Conexión abierta con el puntero de la TV. La flecha se dibuja en la TV por este canal;
            * los toques, el scroll y los botones se mandan por ADB (input tap / swipe / keyevent),
@@ -1430,9 +1572,44 @@ jobs:
               @Volatile
               var alive = true
 
-              /** 0 = deslizamiento táctil, 1 = teclas de página, 2 = rueda (servicio de la TV). */
+              /** 0 = deslizamiento táctil, 1 = teclas de página, 2 = rueda (servicio de la TV), 3 = rueda de mouse real. */
               @Volatile
               var scrollMode = 1
+
+              /** Si es true y el inyector de la TV está listo, el clic sale como clic de mouse real. */
+              @Volatile
+              var useMouse = true
+
+              @Volatile
+              private var injOut: java.io.OutputStream? = null
+              private var injSock: Socket? = null
+              private val injLock = Any()
+
+              val injReady: Boolean get() = injOut != null
+
+              fun attachInject(s: Socket) {
+                  try {
+                      injSock?.close()
+                  } catch (e: Exception) {
+                  }
+                  injSock = s
+                  injOut = s.getOutputStream()
+              }
+
+              private fun injSend(line: String): Boolean {
+                  val o = injOut ?: return false
+                  scope.launch {
+                      try {
+                          synchronized(injLock) {
+                              o.write((line + "\n").toByteArray())
+                              o.flush()
+                          }
+                      } catch (e: Exception) {
+                          injOut = null
+                      }
+                  }
+                  return true
+              }
 
               private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
               private val ch = Channel<String>(Channel.UNLIMITED)
@@ -1503,6 +1680,7 @@ jobs:
 
               fun click() {
                   ch.trySend("F")
+                  if (useMouse && injSend("C ${x.toInt()} ${y.toInt()}")) return
                   run("input tap ${x.toInt()} ${y.toInt()}")
               }
 
@@ -1510,6 +1688,7 @@ jobs:
                   ch.trySend("F")
                   val px = x.toInt()
                   val py = y.toInt()
+                  if (useMouse && injSend("LC $px $py")) return
                   run("input swipe $px $py $px $py 800")
               }
 
@@ -1545,7 +1724,7 @@ jobs:
                           var idle = 0
                           while (true) {
                               delay(90)
-                              val mode = scrollMode
+                              val mode = if (scrollMode == 3 && !injReady) 1 else scrollMode
                               var vx = 0f
                               var vy = 0f
                               synchronized(lock) {
@@ -1577,7 +1756,8 @@ jobs:
                                           } catch (e: Exception) {
                                           }
                                       } else {
-                                          ch.trySend("R ${if (down) "down" else "up"}")
+                                          if (mode == 3) injSend("V ${x.toInt()} ${y.toInt()} ${if (down) -1 else 1}")
+          else ch.trySend("R ${if (down) "down" else "up"}")
                                       }
                                       continue
                                   }
@@ -1621,6 +1801,10 @@ jobs:
                   alive = false
                   scope.cancel()
                   try {
+                      injSock?.close()
+                  } catch (e: Exception) {
+                  }
+                  try {
                       sock.close()
                   } catch (e: Exception) {
                   }
@@ -1628,7 +1812,7 @@ jobs:
           }
 
           object PointerSetup {
-              private fun token(ctx: Context): String {
+              fun token(ctx: Context): String {
                   val p = ctx.getSharedPreferences("tv", 0)
                   val cur = p.getString("ptoken", null)
                   if (cur != null) return cur
@@ -1740,11 +1924,71 @@ jobs:
                       )
                   }
 
+              /**
+               * Arranca en la TV un proceso chico con permisos de shell (como hace scrcpy) que inyecta
+               * eventos de MOUSE reales: clic y rueda. Es lo que entienden las páginas web de los navegadores.
+               */
+              suspend fun startInject(ctx: Context, host: String, session: PointerSession): Boolean =
+                  withContext(Dispatchers.IO) {
+                      val tok = token(ctx)
+
+                      fun conn(): Socket? {
+                          val s = Socket()
+                          try {
+                              s.tcpNoDelay = true
+                              s.connect(InetSocketAddress(host, INJECT_PORT), 1200)
+                              s.soTimeout = 2500
+                              val out = s.getOutputStream()
+                              out.write("AUTH $tok\n".toByteArray())
+                              out.flush()
+                              val line = s.getInputStream().bufferedReader().readLine()
+                              if (line == "OK") {
+                                  s.soTimeout = 0
+                                  return s
+                              }
+                          } catch (e: Exception) {
+                          }
+                          try {
+                              s.close()
+                          } catch (e: Exception) {
+                          }
+                          return null
+                      }
+
+                      conn()?.let {
+                          session.attachInject(it)
+                          return@withContext true
+                      }
+                      try {
+                          val apk = Adb.shell("pm path ${ctx.packageName}").lines()
+                              .firstOrNull { it.startsWith("package:") }
+                              ?.removePrefix("package:")?.trim()
+                              ?: return@withContext false
+                          Adb.shell("pkill -f 'InjectServe[r]'")
+                          kotlinx.coroutines.withTimeoutOrNull(6000L) {
+                              Adb.shell(
+                                  "CLASSPATH=${Adb.q(apk)} nohup app_process / com.tvcontrol.InjectServer " +
+                                      "$INJECT_PORT $tok >/dev/null 2>&1 </dev/null &"
+                              )
+                          }
+                          for (i in 0 until 10) {
+                              delay(500)
+                              conn()?.let {
+                                  session.attachInject(it)
+                                  return@withContext true
+                              }
+                          }
+                      } catch (e: Exception) {
+                      }
+                      false
+                  }
+
               /** Quita el servicio de accesibilidad de la TV (el puntero desaparece). */
               suspend fun disable() {
                   try {
                       val list = currentServices()
                       if (SERVICE in list) Adb.shell(listCommand(list.filter { it != SERVICE }))
+                      Adb.shell("pkill -f 'InjectServe[r]'")
                   } catch (e: Exception) {
                   }
               }
@@ -2562,7 +2806,8 @@ jobs:
               var busy by remember { mutableStateOf(false) }
               var speed by remember { mutableFloatStateOf(2.5f) }
               val prefs = remember { ctx.getSharedPreferences("tv", 0) }
-              var smode by remember { mutableIntStateOf(prefs.getInt("smode", 1)) }
+              var smode by remember { mutableIntStateOf(prefs.getInt("smode2", 3)) }
+              var mouseOn by remember { mutableStateOf(prefs.getBoolean("cmouse", true)) }
 
               fun start() {
                   if (busy) return
@@ -2570,8 +2815,12 @@ jobs:
                   error = ""
                   scope.launch {
                       try {
-                          session = PointerSetup.open(ctx, Adb.currentHost) { status = it }
-                          status = "Puntero activo en la TV"
+                          val s = PointerSetup.open(ctx, Adb.currentHost) { status = it }
+                          session = s
+                          status = "Activando mouse real…"
+                          val ok = PointerSetup.startInject(ctx, Adb.currentHost, s)
+                          s.useMouse = mouseOn
+                          status = if (ok) "Puntero activo · mouse real" else "Puntero activo (sin mouse real: usa toques)"
                       } catch (e: Throwable) {
                           error = e.message ?: "Error desconocido"
                           status = "No se pudo activar el puntero"
@@ -2582,6 +2831,7 @@ jobs:
 
               LaunchedEffect(Unit) { start() }
               LaunchedEffect(session, smode) { session?.scrollMode = smode }
+              LaunchedEffect(session, mouseOn) { session?.useMouse = mouseOn }
               DisposableEffect(Unit) { onDispose { session?.close() } }
               // Si la conexión con el puntero se cae, se avisa y se ofrece reintentar.
               LaunchedEffect(session) {
@@ -2630,12 +2880,23 @@ jobs:
                   }
                   Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       Text("Scroll:", fontSize = 12.sp)
-                      listOf(1 to "Teclas", 2 to "Rueda", 0 to "Táctil").forEach { (m, label) ->
+                      listOf(3 to "Mouse", 1 to "Teclas", 0 to "Táctil").forEach { (m, label) ->
                           Btn3D(
-                              label, { smode = m; prefs.edit().putInt("smode", m).apply() },
+                              label, { smode = m; prefs.edit().putInt("smode2", m).apply() },
                               color = if (smode == m) TvGreen else TvSlate, small = true
                           )
                       }
+                  }
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Text("Clic:", fontSize = 12.sp)
+                      Btn3D(
+                          "Mouse real", { mouseOn = true; prefs.edit().putBoolean("cmouse", true).apply() },
+                          color = if (mouseOn) TvGreen else TvSlate, small = true
+                      )
+                      Btn3D(
+                          "Táctil", { mouseOn = false; prefs.edit().putBoolean("cmouse", false).apply() },
+                          color = if (!mouseOn) TvGreen else TvSlate, small = true
+                      )
                   }
                   Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       Btn3D("◀ Atrás", { session?.key("back") }, color = TvSlate, small = true)
